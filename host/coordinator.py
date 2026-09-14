@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Protocol
 
 from host.artifacts import ArtifactStore
+from host.evidence import EvidenceStore
 from host.errors import CommandError, capability_unavailable
 from host.ledger import Ledger
 
@@ -69,6 +70,7 @@ class UpdateCoordinator:
         *,
         preparation_verified: bool = False,
         runtime_verified: bool = False,
+        evidence_store: EvidenceStore | None = None,
     ) -> None:
         self.ledger = ledger
         self.artifacts = artifacts
@@ -76,6 +78,7 @@ class UpdateCoordinator:
         self.runtime_provider = runtime_provider
         self.preparation_verified = preparation_verified
         self.runtime_verified = runtime_verified
+        self.evidence = evidence_store or EvidenceStore(ledger)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="relay-liveloop-update")
         self._closed = False
         self._submit_lock = threading.Lock()
@@ -403,15 +406,27 @@ class UpdateCoordinator:
                     runtime_changed=None,
                     recoverable=False,
                 )
-        normalized = self._validate_apply_outcome(outcome)
         after = self._observe_runtime(task["sessionId"])
         assert after is not None
-        if normalized["runtimeRevisionAfter"] is not None and normalized["runtimeRevisionAfter"] != after["runtimeRevision"]:
-            raise CommandError("STATE_UNKNOWN", "Apply result does not match reconciled runtime revision.", stage="runtime_reconcile", runtime_changed=None, recoverable=False)
-        if normalized["runtimeChanged"] is True and after["runtimeRevision"] == before["runtimeRevision"]:
-            raise CommandError("STATE_UNKNOWN", "Provider reported a runtime change without a new runtime revision.", stage="runtime_reconcile", runtime_changed=None, recoverable=False)
-        if normalized["facts"]:
-            self.ledger.update_task_facts(task["taskId"], normalized["facts"])
+        observed_runtime_changed = after["runtimeRevision"] != before["runtimeRevision"]
+        try:
+            normalized = self._validate_apply_outcome(outcome)
+            if normalized["runtimeRevisionAfter"] is not None and normalized["runtimeRevisionAfter"] != after["runtimeRevision"]:
+                raise CommandError("STATE_UNKNOWN", "Apply result does not match reconciled runtime revision.", stage="runtime_reconcile", runtime_changed=None, recoverable=False)
+            if normalized["runtimeChanged"] is True and not observed_runtime_changed:
+                raise CommandError("STATE_UNKNOWN", "Provider reported a runtime change without a new runtime revision.", stage="runtime_reconcile", runtime_changed=None, recoverable=False)
+            effective_facts = self._record_apply_facts(task, plan, normalized, after)
+        except CommandError as error:
+            if error.runtime_changed is not None:
+                raise CommandError(
+                    error.code,
+                    error.message,
+                    stage=error.stage,
+                    runtime_changed=observed_runtime_changed,
+                    recoverable=error.recoverable,
+                    details=error.details,
+                ) from error
+            raise
         for method_state in normalized["methodStates"]:
             self.ledger.set_method_state(method_state)
         state = normalized["status"]
@@ -423,7 +438,7 @@ class UpdateCoordinator:
             result={
                 "appliedSteps": normalized["appliedSteps"],
                 "runtimeRevisionAfter": normalized["runtimeRevisionAfter"],
-                "facts": normalized["facts"],
+                "facts": effective_facts,
             },
             error=normalized["error"],
         )
@@ -441,15 +456,79 @@ class UpdateCoordinator:
         facts = value["facts"]
         if not isinstance(facts, dict) or not facts.keys() <= FACT_KEYS or any(item is not None and type(item) is not bool for item in facts.values()):
             raise CommandError("CONTRACT_MISMATCH", "Runtime facts contain unsupported names or values.", stage="runtime_reconcile")
-        if facts.get("visualReviewed") is True:
-            raise CommandError("CONTRACT_MISMATCH", "Runtime apply cannot infer visualReviewed without a separate reviewed-evidence record.", stage="runtime_reconcile")
+        if any(facts.get(key) is not None for key in ("checksPassed", "visualReviewed", "freshVerified")):
+            raise CommandError("CONTRACT_MISMATCH", "Runtime apply cannot report test, visual-review, or fresh-verification facts.", stage="runtime_reconcile")
         if not isinstance(value["appliedSteps"], list) or any(not isinstance(item, str) or not item for item in value["appliedSteps"]):
             raise CommandError("CONTRACT_MISMATCH", "appliedSteps must be a string array.", stage="runtime_reconcile")
         if not isinstance(value["methodStates"], list) or any(not isinstance(item, dict) for item in value["methodStates"]):
             raise CommandError("CONTRACT_MISMATCH", "methodStates must be an array of method ledger records.", stage="runtime_reconcile")
-        if value["error"] is not None and not isinstance(value["error"], dict):
-            raise CommandError("CONTRACT_MISMATCH", "Runtime provider error must be an object or null.", stage="runtime_reconcile")
+        if value["status"] == "completed" and value["error"] is not None:
+            raise CommandError("CONTRACT_MISMATCH", "A completed runtime result cannot include an error.", stage="runtime_reconcile")
+        if value["status"] in {"failed", "state_unknown"} and not isinstance(value["error"], dict):
+            raise CommandError("CONTRACT_MISMATCH", "A failed runtime result requires an error object.", stage="runtime_reconcile")
         return dict(value)
+
+    def _record_apply_facts(
+        self,
+        task: dict[str, Any],
+        plan: dict[str, Any],
+        normalized: dict[str, Any],
+        observed: dict[str, Any],
+    ) -> dict[str, bool | None]:
+        claimed = normalized["facts"]
+        if normalized["status"] != "completed":
+            if any(value is not None for value in claimed.values()):
+                raise CommandError(
+                    "CONTRACT_MISMATCH",
+                    "A non-completed runtime result cannot write terminal task facts.",
+                    stage="runtime_reconcile",
+                )
+            return self.ledger.get_task(task["taskId"])["facts"]
+
+        evidence: dict[str, dict[str, Any]] = {}
+        if claimed.get("sourceSaved") is not None:
+            current_input = self.preparation_provider.current_input_snapshot(task) if self.preparation_provider else None
+            if claimed["sourceSaved"] is True and current_input != plan["inputSnapshot"]:
+                raise CommandError(
+                    "INPUT_CHANGED",
+                    "sourceSaved=true does not match the current prepared source snapshot.",
+                    stage="runtime_reconcile",
+                    runtime_changed=None,
+                    recoverable=False,
+                )
+            evidence["sourceSaved"] = {
+                "details": {
+                    "inputSnapshot": plan["inputSnapshot"],
+                    "currentInputSnapshot": current_input,
+                    "planId": plan["planId"],
+                    "preparationProviderId": getattr(self.preparation_provider, "provider_id", None),
+                },
+                "artifactIds": [],
+            }
+        if claimed.get("runtimeMatched") is not None:
+            expected = plan["details"].get("expectedRuntimeRevisionAfter")
+            if claimed["runtimeMatched"] is True and expected != observed["runtimeRevision"]:
+                raise CommandError(
+                    "STATE_UNKNOWN",
+                    "runtimeMatched=true does not match the prepared expected runtime revision.",
+                    stage="runtime_reconcile",
+                    runtime_changed=None,
+                    recoverable=False,
+                )
+            evidence["runtimeMatched"] = {
+                "details": {
+                    "sessionId": task["sessionId"],
+                    "runtimeRevision": observed["runtimeRevision"],
+                    "expectedRuntimeRevision": expected,
+                    "planId": plan["planId"],
+                    "moduleGeneration": observed["moduleGeneration"],
+                    "resourceRelease": observed["resourceRelease"],
+                    "viewGeneration": observed["viewGeneration"],
+                },
+                "artifactIds": [],
+            }
+        persisted = self.evidence.apply_task_facts(task["taskId"], "iterate", claimed, evidence)
+        return persisted["facts"]
 
     def _bind_job_plan(self, job_id: str, plan_id: str) -> None:
         with self.ledger.transaction() as connection:
@@ -484,12 +563,20 @@ class UpdateCoordinator:
                         if outcome is None:
                             raise CommandError("STATE_UNKNOWN", "Runtime provider cannot reconcile the interrupted apply.", stage="runtime_reconcile", runtime_changed=None, recoverable=False)
                         normalized = self._validate_apply_outcome(outcome)
+                        task = self.ledger.get_task(plan["taskId"])
+                        observed = self._observe_runtime(task["sessionId"])
+                        assert observed is not None
+                        if normalized["runtimeRevisionAfter"] is not None and normalized["runtimeRevisionAfter"] != observed["runtimeRevision"]:
+                            raise CommandError("STATE_UNKNOWN", "Reconciled result does not match the observed runtime revision.", stage="runtime_reconcile", runtime_changed=None, recoverable=False)
+                        effective_facts = self._record_apply_facts(task, plan, normalized, observed)
+                        for method_state in normalized["methodStates"]:
+                            self.ledger.set_method_state(method_state)
                         self.ledger.update_job(
                             job["jobId"],
                             state=normalized["status"],
                             stage="runtime_reconciled",
                             runtime_changed=normalized["runtimeChanged"],
-                            result={"appliedSteps": normalized["appliedSteps"], "runtimeRevisionAfter": normalized["runtimeRevisionAfter"], "facts": normalized["facts"]},
+                            result={"appliedSteps": normalized["appliedSteps"], "runtimeRevisionAfter": normalized["runtimeRevisionAfter"], "facts": effective_facts},
                             error=normalized["error"],
                         )
                     except Exception as exc:

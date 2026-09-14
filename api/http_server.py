@@ -6,6 +6,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from host.errors import CommandError
 from host.service import CommandService
@@ -53,11 +54,17 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _error(self, status: int, error: CommandError, request_id: str = "") -> None:
+    def _correlation_id(self) -> str:
+        supplied = self.headers.get("X-Relay-Request-Id")
+        if isinstance(supplied, str) and ID_RE.fullmatch(supplied):
+            return supplied
+        return f"http_{uuid4().hex}"
+
+    def _error(self, status: int, error: CommandError, request_id: str | None = None) -> None:
         self._send_json(
             status,
             {
-                "requestId": request_id,
+                "requestId": request_id or self._correlation_id(),
                 "status": "failed" if error.code != "STATE_UNKNOWN" else "state_unknown",
                 "jobId": None,
                 "planId": None,

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
 class RelayHTTPError(RuntimeError):
@@ -29,10 +32,19 @@ class RelayHTTPClient:
         self.bearer_token = bearer_token
         self.timeout_seconds = timeout_seconds
 
-    def _request(self, method: str, path: str, body: bytes | None = None, content_type: str | None = None) -> bytes:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        content_type: str | None = None,
+        request_id: str | None = None,
+    ) -> bytes:
         headers = {"Authorization": f"Bearer {self.bearer_token}", "Accept": "application/json"}
         if content_type:
             headers["Content-Type"] = content_type
+        if isinstance(request_id, str) and CORRELATION_ID_RE.fullmatch(request_id):
+            headers["X-Relay-Request-Id"] = request_id
         request = Request(self.base_url + path, data=body, method=method, headers=headers)
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
@@ -49,7 +61,7 @@ class RelayHTTPClient:
 
     def command(self, envelope: dict[str, Any]) -> dict[str, Any]:
         payload = json.dumps(envelope, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-        raw = self._request("POST", "/commands", payload, "application/json")
+        raw = self._request("POST", "/commands", payload, "application/json", envelope.get("requestId"))
         return json.loads(raw.decode("utf-8"))
 
     def status(self) -> dict[str, Any]:

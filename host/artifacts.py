@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import re
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -11,22 +12,28 @@ from .validation import ID_RE, SHA256_RE
 
 HASH_CHUNK_SIZE = 1024 * 1024
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+MEDIA_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}$")
+
+
+def sha256_stream(stream: BinaryIO) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := stream.read(HASH_CHUNK_SIZE):
+        size += len(chunk)
+        if size > MAX_ARTIFACT_BYTES:
+            raise CommandError(
+                "CONTRACT_MISMATCH",
+                f"Artifact exceeds {MAX_ARTIFACT_BYTES} bytes.",
+                stage="artifact",
+            )
+        digest.update(chunk)
+    stream.seek(0)
+    return digest.hexdigest(), size
 
 
 def sha256_file(path: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    size = 0
     with path.open("rb") as stream:
-        while chunk := stream.read(HASH_CHUNK_SIZE):
-            size += len(chunk)
-            if size > MAX_ARTIFACT_BYTES:
-                raise CommandError(
-                    "CONTRACT_MISMATCH",
-                    f"Artifact exceeds {MAX_ARTIFACT_BYTES} bytes.",
-                    stage="artifact",
-                )
-            digest.update(chunk)
-    return digest.hexdigest(), size
+        return sha256_stream(stream)
 
 
 class ArtifactStore:
@@ -72,6 +79,9 @@ class ArtifactStore:
                 raise CommandError("CONTRACT_MISMATCH", "expected_sha256 must be a lowercase SHA-256 value.", stage="artifact")
             if digest != expected_sha256:
                 raise CommandError("INPUT_CHANGED", "Artifact hash differs from the expected immutable input.", stage="artifact")
+        effective_media_type = media_type or mimetypes.guess_type(scoped.name)[0] or "application/octet-stream"
+        if not isinstance(effective_media_type, str) or not MEDIA_TYPE_RE.fullmatch(effective_media_type):
+            raise CommandError("CONTRACT_MISMATCH", "Artifact media_type must be a bounded type/subtype token.", stage="artifact")
         record = self.ledger.register_artifact(
             {
                 "taskId": task_id,
@@ -81,7 +91,7 @@ class ArtifactStore:
                 "sha256": digest,
                 "sizeBytes": size,
                 "kind": kind,
-                "mediaType": media_type or mimetypes.guess_type(scoped.name)[0] or "application/octet-stream",
+                "mediaType": effective_media_type,
                 "originalName": scoped.name,
             }
         )
@@ -102,12 +112,18 @@ class ArtifactStore:
             raise CommandError("CONTRACT_MISMATCH", "artifactId contains unsupported characters.", stage="artifact")
         record = self.ledger.get_artifact(artifact_id)
         path = self._resolve_scoped(record["absolutePath"])
-        digest, size = sha256_file(path)
+        stream = path.open("rb")
+        try:
+            digest, size = sha256_stream(stream)
+        except Exception:
+            stream.close()
+            raise
         if digest != record["sha256"] or size != record["sizeBytes"]:
+            stream.close()
             raise CommandError(
                 "INPUT_CHANGED",
                 "Registered artifact bytes changed after registration.",
                 stage="artifact",
                 recoverable=False,
             )
-        return self.public_metadata(record), path.open("rb")
+        return self.public_metadata(record), stream

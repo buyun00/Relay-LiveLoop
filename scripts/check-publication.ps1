@@ -24,6 +24,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$disallowedGitEnvironment = @(
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_OBJECT_DIRECTORY', 'GIT_COMMON_DIR',
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_SHALLOW_FILE',
+    'GIT_REPLACE_REF_BASE'
+)
+foreach ($name in $disallowedGitEnvironment) {
+    if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, 'Process'))) {
+        throw "Git object or worktree override environment is active: $name"
+    }
+}
+
 $repositoryItem = Get-Item -LiteralPath $Repository -Force -ErrorAction Stop
 if (-not $repositoryItem.PSIsContainer) {
     throw 'Repository must be a directory.'
@@ -57,6 +68,61 @@ function Get-GitLines {
         throw "Git command failed: git $($GitArguments -join ' ')"
     }
     @($result.Lines)
+}
+
+function Invoke-GitBytes {
+    param([string[]]$GitArguments)
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.ArgumentList.Add('-C')
+    $startInfo.ArgumentList.Add($Repository)
+    foreach ($argument in $GitArguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $memory = [IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) {
+            throw 'Unable to start Git for binary-safe object inspection.'
+        }
+        $copyTask = $process.StandardOutput.BaseStream.CopyToAsync($memory)
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $copyTask.GetAwaiter().GetResult() | Out-Null
+        $errorText = $errorTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw "Git binary-safe inspection failed: $errorText"
+        }
+        Write-Output -NoEnumerate ([byte[]]$memory.ToArray())
+    }
+    finally {
+        $memory.Dispose()
+        $process.Dispose()
+    }
+}
+
+$strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+function Get-GitNullRecords {
+    param([string[]]$GitArguments)
+
+    [byte[]]$bytes = Invoke-GitBytes -GitArguments $GitArguments
+    try {
+        $content = $strictUtf8.GetString($bytes)
+    }
+    catch [Text.DecoderFallbackException] {
+        throw 'Git returned a path that is not valid UTF-8.'
+    }
+    if ($content.Length -eq 0) {
+        return
+    }
+    @($content.Split([char]0, [StringSplitOptions]::RemoveEmptyEntries))
 }
 
 $violations = [Collections.Generic.List[object]]::new()
@@ -111,7 +177,8 @@ $sensitiveShapes = @(
     '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----',
     '(?i)\bgh[pousr]_[A-Za-z0-9]{20,}\b',
     '(?i)\bAKIA[0-9A-Z]{16}\b',
-    '(?i)(password|passwd|api[_-]?key|access[_-]?token|secret)\s*[:=]\s*[''"][^''"]{8,}[''"]'
+    '(?i)(password|passwd|api[_-]?key|access[_-]?token|secret)\s*[:=]\s*[''"][^''"]{8,}[''"]',
+    '(?i)(password|passwd|api[_-]?key|access[_-]?token|secret)\s*[:=]\s*(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,}'
 )
 
 function Scan-Text {
@@ -165,12 +232,35 @@ function Scan-Entry {
         Add-Violation -Kind 'blocked-extension' -Path $Path -Commit $Commit
     }
 
-    $blobResult = Invoke-GitResult -GitArguments @('cat-file', '-p', $Blob)
-    if ($blobResult.ExitCode -ne 0) {
+    try {
+        [byte[]]$blobBytes = Invoke-GitBytes -GitArguments @('cat-file', 'blob', $Blob)
+    }
+    catch {
         Add-Violation -Kind 'unreadable-blob' -Path $Path -Commit $Commit
         return
     }
-    Scan-Text -Content ([string]::Join("`n", $blobResult.Lines)) -Path $Path -Commit $Commit
+    if ($blobBytes.Length -gt 16MB) {
+        Add-Violation -Kind 'oversized-blob' -Path $Path -Commit $Commit
+        return
+    }
+    if ($blobBytes -contains 0) {
+        Add-Violation -Kind 'binary-content' -Path $Path -Commit $Commit
+        return
+    }
+    try {
+        $content = $strictUtf8.GetString($blobBytes)
+    }
+    catch [Text.DecoderFallbackException] {
+        Add-Violation -Kind 'binary-content' -Path $Path -Commit $Commit
+        return
+    }
+    foreach ($value in $blobBytes) {
+        if (($value -lt 9) -or ($value -gt 13 -and $value -lt 32) -or $value -eq 127) {
+            Add-Violation -Kind 'binary-content' -Path $Path -Commit $Commit
+            return
+        }
+    }
+    Scan-Text -Content $content -Path $Path -Commit $Commit
 }
 
 $topLines = @(Get-GitLines -GitArguments @('rev-parse', '--show-toplevel'))
@@ -194,6 +284,10 @@ if (-not $gitDirectory.Equals($commonDirectory, [StringComparison]::OrdinalIgnor
 }
 if (Test-Path -LiteralPath (Join-Path $gitDirectory 'objects\info\alternates')) {
     throw 'Git object alternates are not allowed.'
+}
+$replaceRefs = @(Get-GitLines -GitArguments @('for-each-ref', '--format=%(refname)', 'refs/replace/'))
+if ($replaceRefs.Count -gt 0) {
+    throw 'Git replacement objects are not allowed.'
 }
 
 $branchLines = @(Get-GitLines -GitArguments @('branch', '--show-current'))
@@ -263,15 +357,20 @@ $scannedCommits = 0
 $outgoingCommits = @()
 
 if ($Mode -in @('staged', 'all')) {
-    $stagedPaths = @(Get-GitLines -GitArguments @('diff', '--cached', '--name-only', '--diff-filter=ACMR', '--'))
-    foreach ($path in $stagedPaths) {
-        $indexLines = @(Get-GitLines -GitArguments @('ls-files', '-s', '--', $path))
-        $indexEntry = $indexLines[0]
-        if ($indexEntry -notmatch '^(\d{6}) ([0-9a-f]+) \d+\t(.+)$') {
-            Add-Violation -Kind 'invalid-index-entry' -Path $path -Commit $null
+    foreach ($indexEntry in @(Get-GitNullRecords -GitArguments @('ls-files', '-s', '-z'))) {
+        if ($indexEntry -notmatch '^(\d{6}) ([0-9a-f]+) (\d+)\t([\s\S]+)$') {
+            Add-Violation -Kind 'invalid-index-entry' -Path $indexEntry -Commit $null
             continue
         }
-        Scan-Entry -ModeValue $Matches[1] -Blob $Matches[2] -Path $Matches[3] -Commit $null
+        $modeValue = $Matches[1]
+        $blob = $Matches[2]
+        $stage = $Matches[3]
+        $path = $Matches[4]
+        if ($stage -ne '0') {
+            Add-Violation -Kind 'unmerged-index-entry' -Path $path -Commit $null
+            continue
+        }
+        Scan-Entry -ModeValue $modeValue -Blob $blob -Path $path -Commit $null
         $scannedEntries++
     }
 }
@@ -285,15 +384,23 @@ if ($Mode -in @('outgoing', 'all')) {
         Scan-Text -Content $message -Path '<commit-message>' -Commit $commit
         $scannedCommits++
 
-        foreach ($entry in @(Get-GitLines -GitArguments @('ls-tree', '-r', $commit))) {
-            if ($entry -notmatch '^(\d{6}) blob ([0-9a-f]+)\t(.+)$') {
+        foreach ($entry in @(Get-GitNullRecords -GitArguments @('ls-tree', '-r', '-z', $commit))) {
+            if ($entry -notmatch '^(\d{6}) ([^ ]+) ([0-9a-f]+)\t([\s\S]+)$') {
                 Add-Violation -Kind 'unsupported-tree-entry' -Path $entry -Commit $commit
                 continue
             }
-            $key = "$($Matches[2])`t$($Matches[3])"
+            $modeValue = $Matches[1]
+            $objectType = $Matches[2]
+            $blob = $Matches[3]
+            $path = $Matches[4]
+            if ($objectType -ne 'blob' -and $modeValue -in @('100644', '100755')) {
+                Add-Violation -Kind 'unsupported-tree-entry' -Path $path -Commit $commit
+                continue
+            }
+            $key = "$blob`t$path"
             if (-not $seenEntries.ContainsKey($key)) {
                 $seenEntries[$key] = $true
-                Scan-Entry -ModeValue $Matches[1] -Blob $Matches[2] -Path $Matches[3] -Commit $commit
+                Scan-Entry -ModeValue $modeValue -Blob $blob -Path $path -Commit $commit
                 $scannedEntries++
             }
         }

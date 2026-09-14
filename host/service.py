@@ -8,6 +8,7 @@ from .coordinator import UpdateCoordinator
 from .errors import CommandError
 from .ledger import Ledger
 from .providers import ProviderRegistry
+from .result_policy import ProviderResultPolicy
 from .validation import canonical_command_hash, validate_command
 
 FACT_KEYS = ("sourceSaved", "runtimeMatched", "checksPassed", "visualReviewed", "freshVerified")
@@ -40,11 +41,13 @@ class CommandService:
         artifacts: ArtifactStore,
         providers: ProviderRegistry | None = None,
         coordinator: UpdateCoordinator | None = None,
+        result_policy: ProviderResultPolicy | None = None,
     ) -> None:
         self.ledger = ledger
         self.artifacts = artifacts
         self.providers = providers or ProviderRegistry()
         self.coordinator = coordinator
+        self.result_policy = result_policy or ProviderResultPolicy(ledger, artifacts)
         self._execute_lock = threading.RLock()
 
     def _response(
@@ -200,12 +203,14 @@ class CommandService:
                 status="completed",
                 result={
                     "task": task,
-                    "summary": "Report contains ledger facts only; no visual or fresh verification is inferred.",
+                    "evidence": self.result_policy.evidence.list_task(task_id),
+                    "summary": "Report contains persisted facts and their evidence records; omitted review or fresh verification remains unknown.",
                 },
                 facts=task["facts"],
             )
         capability = PROVIDER_OPERATIONS[operation]
         provider_result = self.providers.execute(capability, operation, command)
+        provider_result = self.result_policy.validate(operation, task_id, provider_result, request_id)
         return self._response(
             request_id,
             status=provider_result.get("status", "completed"),
@@ -227,10 +232,12 @@ class CommandService:
         capabilities = {item["capability"]: item for item in self.providers.states()}
         if self.coordinator is not None:
             capabilities.update(self.coordinator.capability_states())
+        ledger_summary = self.ledger.summary()
+        ledger_summary["counts"]["evidenceRecords"] = self.result_policy.evidence.count()
         return {
             "service": "Relay LiveLoop",
             "protocolVersion": 1,
-            "ledger": self.ledger.summary(),
+            "ledger": ledger_summary,
             "capabilities": [capabilities[key] for key in sorted(capabilities)],
             "runtime": {
                 "sessionId": None,

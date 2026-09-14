@@ -1,5 +1,5 @@
-"""Clients for Relay LiveLoop thin transports."""
+"""Batch-003 client overlay."""
 
-from .http_client import RelayHTTPClient, RelayHTTPError
+from pkgutil import extend_path
 
-__all__ = ["RelayHTTPClient", "RelayHTTPError"]
+__path__ = extend_path(__path__, __name__)

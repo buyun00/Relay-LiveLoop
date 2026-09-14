@@ -1,5 +1,5 @@
-"""HTTP adapter for the Relay LiveLoop command service."""
+"""Batch-003 HTTP overlay."""
 
-from .http_server import create_http_server
+from pkgutil import extend_path
 
-__all__ = ["create_http_server"]
+__path__ = extend_path(__path__, __name__)
