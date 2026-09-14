@@ -455,6 +455,34 @@ try {
             Invoke-PublicationChecker -Repository $repo -Mode staged -SkipRemoteCheck
         }
 
+    Add-ConformanceCase -Name 'unquoted-lowercase-password-shape' `
+        -Requirement 'An unquoted lowercase credential-like assignment is blocked using only a clearly fake value.' `
+        -Expected blocked -ExpectedKind 'credential-shape' -Action {
+            $repo = New-SyntheticRepository -Name 'unquoted-lowercase-credential'
+            New-Item -ItemType Directory -Path (Join-Path $repo 'host') | Out-Null
+            $credentialName = 'pass' + 'word'
+            $fakeValue = 'syntheticlowercaseonlyvalue'
+            Set-Content -LiteralPath (Join-Path $repo 'host\settings.txt') -Value ($credentialName + '=' + $fakeValue) -Encoding utf8
+            $null = Invoke-TestGit -Repository $repo -GitArguments @('add', '--', 'host/settings.txt')
+            Invoke-PublicationChecker -Repository $repo -Mode staged -SkipRemoteCheck
+        }
+
+    Add-ConformanceCase -Name 'outgoing-same-blob-mode-transition' `
+        -Requirement 'Outgoing history scans a disallowed mode even when a newer commit has the same blob and path in a regular-file mode.' `
+        -Expected blocked -ExpectedKind 'unsupported-git-mode' -Action {
+            $repo = New-SyntheticRepository -Name 'outgoing-mode-transition'
+            Add-BaselineCommit -Repository $repo
+            $remote = New-LocalBareRemote -Name 'outgoing-mode-transition.git'
+            Connect-And-PushBaseline -Repository $repo -RemotePath $remote
+            Set-Content -LiteralPath (Join-Path $repo 'synthetic-link-target.txt') -Value 'docs/target.txt' -Encoding ascii -NoNewline
+            $blob = @(Invoke-TestGit -Repository $repo -GitArguments @('hash-object', '-w', '--', 'synthetic-link-target.txt'))[0]
+            $null = Invoke-TestGit -Repository $repo -GitArguments @('update-index', '--add', '--cacheinfo', "120000,$blob,host/link-ref")
+            $null = Invoke-TestGit -Repository $repo -GitArguments @('commit', '-m', 'Add synthetic link mode')
+            $null = Invoke-TestGit -Repository $repo -GitArguments @('update-index', '--cacheinfo', "100644,$blob,host/link-ref")
+            $null = Invoke-TestGit -Repository $repo -GitArguments @('commit', '-m', 'Restore synthetic regular mode')
+            Invoke-PublicationChecker -Repository $repo -Mode outgoing -ExpectedRemoteUrl $remote
+        }
+
     Add-ConformanceCase -Name 'exact-local-remote-binding' `
         -Requirement 'An exact current branch plus one matching fetch/push URL and local destination ref passes.' `
         -Expected pass -Action {
@@ -523,7 +551,8 @@ try {
             'symlink and gitlink modes including a staged type change',
             'Git LFS pointer text',
             'alternates file, environment alternate reliance, and linked worktree sharing',
-            'quoted and unquoted fake credential-like assignments',
+            'quoted, unquoted mixed-case, and unquoted lowercase fake credential-like assignments',
+            'outgoing same-blob same-path Git mode transitions',
             'exact branch, fetch URL, push URL, destination ref, and URL rewrite binding'
         )
         cases = @($results)

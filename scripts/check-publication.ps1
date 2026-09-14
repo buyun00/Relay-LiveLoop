@@ -178,7 +178,7 @@ $sensitiveShapes = @(
     '(?i)\bgh[pousr]_[A-Za-z0-9]{20,}\b',
     '(?i)\bAKIA[0-9A-Z]{16}\b',
     '(?i)(password|passwd|api[_-]?key|access[_-]?token|secret)\s*[:=]\s*[''"][^''"]{8,}[''"]',
-    '(?i)(password|passwd|api[_-]?key|access[_-]?token|secret)\s*[:=]\s*(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,}'
+    '(?i)\b(password|passwd|api[_-]?key|access[_-]?token|secret)\b\s*[:=]\s*[A-Za-z0-9_-]{8,}'
 )
 
 function Scan-Text {
@@ -397,7 +397,7 @@ if ($Mode -in @('outgoing', 'all')) {
                 Add-Violation -Kind 'unsupported-tree-entry' -Path $path -Commit $commit
                 continue
             }
-            $key = "$blob`t$path"
+            $key = "$modeValue`t$objectType`t$blob`t$path"
             if (-not $seenEntries.ContainsKey($key)) {
                 $seenEntries[$key] = $true
                 Scan-Entry -ModeValue $modeValue -Blob $blob -Path $path -Commit $commit
