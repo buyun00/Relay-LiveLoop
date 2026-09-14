@@ -15,4 +15,4 @@ dist/
 *.tmp
 artifacts/
 runtime-data/
-
+tests/unity-synthetic/**/.out/
