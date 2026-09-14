@@ -70,6 +70,26 @@ class RelayHTTPClient:
     def capabilities(self) -> dict[str, Any]:
         return json.loads(self._request("GET", "/capabilities").decode("utf-8"))
 
+    def shutdown(self, request_id: str, *, wait_for_active_jobs: bool) -> dict[str, Any]:
+        if not isinstance(request_id, str) or not CORRELATION_ID_RE.fullmatch(request_id):
+            raise ValueError("request_id is invalid.")
+        if type(wait_for_active_jobs) is not bool:
+            raise ValueError("wait_for_active_jobs must be a boolean.")
+        payload = json.dumps(
+            {
+                "protocolVersion": 1,
+                "requestId": request_id,
+                "mode": "graceful",
+                "preservePlayer": True,
+                "waitForActiveJobs": wait_for_active_jobs,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        raw = self._request("POST", "/lifecycle/shutdown", payload, "application/json", request_id)
+        return json.loads(raw.decode("utf-8"))
+
     def job(self, job_id: str) -> dict[str, Any]:
         return json.loads(self._request("GET", f"/jobs/{job_id}").decode("utf-8"))
 

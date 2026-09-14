@@ -500,6 +500,139 @@ class HTTPCLIProtocolConformance(unittest.TestCase):
         self.assertEqual("AUTH_REQUIRED", response["error"]["code"])
         assert_result_envelope(self, response)
 
+    def test_status_and_capabilities_expose_explicit_host_lifecycle_contract(self) -> None:
+        status_code, _headers, status = self.json_request("GET", "/status")
+        self.assertEqual(200, status_code)
+        lifecycle = status["hostLifecycle"]
+        self.assertEqual("running", lifecycle["state"])
+        self.assertTrue(lifecycle["acceptingCommands"])
+        self.assertFalse(lifecycle["shutdownRequested"])
+        self.assertFalse(lifecycle["safeToExit"])
+        self.assertEqual("preserve", lifecycle["playerPolicy"])
+        self.assertEqual([], lifecycle["activeJobs"])
+        self.assertEqual([], lifecycle["nonInterruptibleJobs"])
+
+        capability_code, _headers, capabilities = self.json_request("GET", "/capabilities")
+        self.assertEqual(200, capability_code)
+        contract = capabilities["hostLifecycle"]
+        self.assertTrue(contract["available"])
+        self.assertEqual("bearer", contract["authentication"])
+        self.assertEqual("POST /lifecycle/shutdown", contract["shutdownEndpoint"])
+        self.assertEqual(["graceful"], contract["modes"])
+        self.assertTrue(contract["supportsWaitForActiveJobs"])
+        self.assertEqual("preserve", contract["playerPolicy"])
+
+    def test_shutdown_requires_authentication_and_preserve_player(self) -> None:
+        request = {
+            "protocolVersion": 1,
+            "requestId": "request-synthetic-unauthorized-shutdown",
+            "mode": "graceful",
+            "preservePlayer": True,
+            "waitForActiveJobs": False,
+        }
+        unauthorized_status, _headers, unauthorized = self.json_request(
+            "POST", "/lifecycle/shutdown", value=request, token=None
+        )
+        self.assertEqual(401, unauthorized_status)
+        self.assertEqual("AUTH_REQUIRED", unauthorized["error"]["code"])
+
+        request["requestId"] = "request-synthetic-player-stop-refused"
+        request["preservePlayer"] = False
+        refused_status, _headers, refused = self.json_request(
+            "POST", "/lifecycle/shutdown", value=request
+        )
+        self.assertEqual(400, refused_status)
+        assert_result_envelope(self, refused, expected_request_id=request["requestId"])
+        self.assertEqual("CONTRACT_MISMATCH", refused["error"]["code"])
+        self.assertIsNotNone(self.process)
+        self.assertIsNone(self.process.poll())
+
+    def test_shutdown_refuses_or_drains_from_exact_active_job_stages(self) -> None:
+        replay_request, original = self.open_task("request-synthetic-replay-during-drain")
+        self.seed_jobs()
+        request = {
+            "protocolVersion": 1,
+            "requestId": "request-synthetic-refuse-active",
+            "mode": "graceful",
+            "preservePlayer": True,
+            "waitForActiveJobs": False,
+        }
+        refused_status, _headers, refused = self.json_request(
+            "POST", "/lifecycle/shutdown", value=request
+        )
+        self.assertEqual(409, refused_status)
+        assert_result_envelope(self, refused, expected_request_id=request["requestId"])
+        self.assertEqual("CONFLICT", refused["error"]["code"])
+        lifecycle = refused["result"]["hostLifecycle"]
+        self.assertEqual("running", lifecycle["state"])
+        self.assertFalse(lifecycle["safeToExit"])
+        self.assertEqual(
+            {"job-synthetic-cancellable", "job-synthetic-applying"},
+            {job["jobId"] for job in lifecycle["activeJobs"]},
+        )
+        self.assertEqual(
+            ["job-synthetic-applying"],
+            [job["jobId"] for job in lifecycle["nonInterruptibleJobs"]],
+        )
+        applying = lifecycle["nonInterruptibleJobs"][0]
+        self.assertEqual("runtime_apply", applying["stage"])
+        self.assertFalse(applying["interruptible"])
+
+        request["requestId"] = "request-synthetic-drain-active"
+        request["waitForActiveJobs"] = True
+        accepted_status, _headers, accepted = self.json_request(
+            "POST", "/lifecycle/shutdown", value=request
+        )
+        self.assertEqual(202, accepted_status)
+        assert_result_envelope(self, accepted, expected_request_id=request["requestId"])
+        self.assertEqual("accepted", accepted["status"])
+        draining = accepted["result"]["hostLifecycle"]
+        self.assertEqual("draining", draining["state"])
+        self.assertFalse(draining["acceptingCommands"])
+        self.assertFalse(draining["safeToExit"])
+        self.assertEqual("preserve", draining["playerPolicy"])
+        self.assertIsNotNone(self.process)
+        self.assertIsNone(self.process.poll())
+
+        replay_status, replayed = self.command(replay_request)
+        self.assertEqual(200, replay_status)
+        self.assertEqual(original, replayed)
+
+        altered_request = dict(replay_request)
+        altered_request["arguments"] = dict(replay_request["arguments"])
+        altered_request["arguments"]["goal"] = "synthetic altered retry"
+        altered_status, altered = self.command(altered_request)
+        self.assertEqual(400, altered_status)
+        self.assertEqual("CONTRACT_MISMATCH", altered["error"]["code"])
+        self.assertEqual("idempotency", altered["error"]["stage"])
+
+        rejected_status, rejected = self.command(
+            envelope("task.open", "request-synthetic-work-during-drain", task_arguments())
+        )
+        self.assertEqual(400, rejected_status)
+        self.assertEqual("CONFLICT", rejected["error"]["code"])
+        self.assertEqual("host_lifecycle", rejected["error"]["stage"])
+
+    def test_safe_graceful_shutdown_exits_host_without_player_action(self) -> None:
+        request_id = "request-synthetic-safe-shutdown"
+        completed = self.run_cli(
+            "shutdown",
+            "--request-id",
+            request_id,
+            "--url",
+            self.base_url,
+            "--json",
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        response = json.loads(completed.stdout)
+        assert_result_envelope(self, response, expected_request_id=request_id)
+        self.assertEqual("accepted", response["status"])
+        lifecycle = response["result"]["hostLifecycle"]
+        self.assertTrue(lifecycle["safeToExit"])
+        self.assertEqual("preserve", lifecycle["playerPolicy"])
+        assert self.process is not None
+        self.assertEqual(0, self.process.wait(timeout=5))
+
     def test_malformed_command_matrix_is_rejected_without_task_side_effects(self) -> None:
         valid_task = task_arguments()
         malformed_commands: list[tuple[str, Any]] = [

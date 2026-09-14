@@ -212,6 +212,33 @@ class Ledger:
             )
         return "new", None
 
+    def replay_command(self, request_id: str, command_hash: str) -> dict[str, Any] | None:
+        """Return a durable prior result without registering a new command."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT command_hash, state, response_json FROM commands WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["command_hash"] != command_hash:
+            raise CommandError(
+                "CONTRACT_MISMATCH",
+                "requestId was already used for a different command.",
+                stage="idempotency",
+                runtime_changed=False,
+                recoverable=False,
+            )
+        if row["state"] == "completed" and row["response_json"]:
+            return load_json(row["response_json"])
+        raise CommandError(
+            "STATE_UNKNOWN",
+            "The prior attempt did not persist a terminal response; reconcile provider and runtime ledgers before any retry.",
+            stage="idempotency",
+            runtime_changed=None,
+            recoverable=False,
+        )
+
     def complete_command(self, request_id: str, response: dict[str, Any]) -> None:
         with self.transaction() as connection:
             changed = connection.execute(
@@ -456,6 +483,30 @@ class Ledger:
             row = self._connection.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         if row is None:
             raise CommandError("CONTRACT_MISMATCH", "jobId is not registered.", stage="lookup")
+        return {
+            "jobId": row["job_id"],
+            "requestId": row["request_id"],
+            "operation": row["operation"],
+            "taskId": row["task_id"],
+            "planId": row["plan_id"],
+            "state": row["state"],
+            "stage": row["stage"],
+            "runtimeChanged": self._nullable_bool(row["runtime_changed"]),
+            "cancelRequested": bool(row["cancel_requested"]),
+            "result": load_json(row["result_json"]),
+            "error": load_json(row["error_json"]),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_active_jobs(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM jobs WHERE state IN ('queued', 'running') ORDER BY created_at, job_id"
+            ).fetchall()
+        return [self._job_from_row(row) for row in rows]
+
+    def _job_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "jobId": row["job_id"],
             "requestId": row["request_id"],

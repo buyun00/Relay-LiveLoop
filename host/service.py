@@ -7,6 +7,7 @@ from .artifacts import ArtifactStore
 from .coordinator import UpdateCoordinator
 from .errors import CommandError
 from .ledger import Ledger
+from .lifecycle import HostLifecycle
 from .providers import ProviderRegistry
 from .result_policy import ProviderResultPolicy
 from .validation import canonical_command_hash, validate_command
@@ -42,12 +43,14 @@ class CommandService:
         providers: ProviderRegistry | None = None,
         coordinator: UpdateCoordinator | None = None,
         result_policy: ProviderResultPolicy | None = None,
+        lifecycle: HostLifecycle | None = None,
     ) -> None:
         self.ledger = ledger
         self.artifacts = artifacts
         self.providers = providers or ProviderRegistry()
         self.coordinator = coordinator
         self.result_policy = result_policy or ProviderResultPolicy(ledger, artifacts)
+        self.lifecycle = lifecycle or HostLifecycle(ledger)
         self._execute_lock = threading.RLock()
 
     def _response(
@@ -89,10 +92,37 @@ class CommandService:
             return self._response(request_id, status="failed", error=error.as_dict(), runtime_changed=error.runtime_changed)
 
         with self._execute_lock:
+            command_hash = canonical_command_hash(command)
+            try:
+                stored = self.ledger.replay_command(request_id, command_hash)
+            except CommandError as error:
+                return self._response(
+                    request_id,
+                    status="state_unknown" if error.code == "STATE_UNKNOWN" else "failed",
+                    error=error.as_dict(),
+                    runtime_changed=error.runtime_changed,
+                )
+            if stored is not None:
+                return stored
+            if not self.lifecycle.allows_command(command["operation"]):
+                error = CommandError(
+                    "CONFLICT",
+                    "Host is draining and is not accepting new work.",
+                    stage="host_lifecycle",
+                    runtime_changed=False,
+                    recoverable=True,
+                    details={"lifecycle": self.lifecycle.status()},
+                )
+                return self._response(
+                    request_id,
+                    status="failed",
+                    error=error.as_dict(),
+                    runtime_changed=False,
+                )
             try:
                 disposition, stored = self.ledger.begin_command(
                     request_id,
-                    canonical_command_hash(command),
+                    command_hash,
                     command["operation"],
                     command["taskId"],
                 )
@@ -121,6 +151,44 @@ class CommandService:
                 response = self._response(request_id, status="state_unknown", error=error.as_dict(), runtime_changed=None)
             self.ledger.complete_command(request_id, response)
             return response
+
+    def request_shutdown(self, raw_request: Any) -> tuple[dict[str, Any], bool]:
+        request_id = raw_request.get("requestId", "invalid-request") if isinstance(raw_request, dict) else "invalid-request"
+        if not isinstance(request_id, str) or not request_id:
+            request_id = "invalid-request"
+        with self._execute_lock:
+            try:
+                decision, should_schedule = self.lifecycle.request_shutdown(raw_request)
+                if decision["accepted"]:
+                    return (
+                        self._response(
+                            request_id,
+                            status="accepted",
+                            result={"shutdownAccepted": True, "hostLifecycle": decision["lifecycle"]},
+                            runtime_changed=False,
+                        ),
+                        should_schedule,
+                    )
+                return (
+                    self._response(
+                        request_id,
+                        status="failed",
+                        result={"shutdownAccepted": False, "hostLifecycle": decision["lifecycle"]},
+                        error=decision["error"],
+                        runtime_changed=False,
+                    ),
+                    False,
+                )
+            except CommandError as error:
+                return (
+                    self._response(
+                        request_id,
+                        status="state_unknown" if error.code == "STATE_UNKNOWN" else "failed",
+                        error=error.as_dict(),
+                        runtime_changed=error.runtime_changed,
+                    ),
+                    False,
+                )
 
     def _dispatch(self, command: dict[str, Any]) -> dict[str, Any]:
         operation = command["operation"]
@@ -237,6 +305,7 @@ class CommandService:
         return {
             "service": "Relay LiveLoop",
             "protocolVersion": 1,
+            "hostLifecycle": self.lifecycle.status(),
             "ledger": ledger_summary,
             "capabilities": [capabilities[key] for key in sorted(capabilities)],
             "runtime": {
@@ -249,4 +318,8 @@ class CommandService:
         }
 
     def capability_summary(self) -> dict[str, Any]:
-        return {"protocolVersion": 1, "capabilities": self.status_summary()["capabilities"]}
+        return {
+            "protocolVersion": 1,
+            "capabilities": self.status_summary()["capabilities"],
+            "hostLifecycle": self.lifecycle.contract(),
+        }

@@ -81,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--timeout", type=float, default=30.0)
     command.add_argument("--json", action="store_true", help="Emit compact JSON. Output is always JSON safe.")
     _common_security(command)
+
+    shutdown = subparsers.add_parser("shutdown", help="Request authenticated graceful Host shutdown while preserving Player.")
+    shutdown.add_argument("--request-id", default=None)
+    shutdown.add_argument("--wait-for-active-jobs", action="store_true")
+    shutdown.add_argument("--url", default=os.environ.get(URL_ENV, "http://127.0.0.1:18760"))
+    shutdown.add_argument("--timeout", type=float, default=30.0)
+    shutdown.add_argument("--json", action="store_true", help="Emit compact JSON. Output is always JSON safe.")
+    _common_security(shutdown)
     return parser
 
 
@@ -99,6 +107,7 @@ def _serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        service.close()
         server.server_close()
         ledger.close()
     return 0
@@ -153,14 +162,49 @@ def _send(args: argparse.Namespace) -> int:
     return 0 if response.get("status") in {"accepted", "completed", "approval_required"} else 2
 
 
+def _shutdown(args: argparse.Namespace) -> int:
+    token = _token_from_args(args)
+    client = RelayHTTPClient(args.url, token, timeout_seconds=args.timeout)
+    request_id = args.request_id or f"request_{uuid4().hex}"
+    try:
+        response = client.shutdown(request_id, wait_for_active_jobs=args.wait_for_active_jobs)
+    except RelayHTTPError as exc:
+        response = exc.response or {
+            "requestId": request_id,
+            "status": "failed",
+            "runtimeChanged": False,
+            "facts": {
+                "sourceSaved": None,
+                "runtimeMatched": None,
+                "checksPassed": None,
+                "visualReviewed": None,
+                "freshVerified": None,
+            },
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "stage": "http_client",
+                "message": str(exc),
+                "recoverable": True,
+                "details": {},
+            },
+            "artifacts": [],
+        }
+    print(json.dumps(response, ensure_ascii=False, allow_nan=False, separators=(",", ":") if args.json else None, indent=None if args.json else 2))
+    return 0 if response.get("status") == "accepted" else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    if raw_args and raw_args[0] not in {"serve", "command", "-h", "--help"}:
+    if raw_args and raw_args[0] not in {"serve", "command", "shutdown", "-h", "--help"}:
         raw_args.insert(0, "command")
     parser = build_parser()
     args = parser.parse_args(raw_args)
     try:
-        return _serve(args) if args.mode == "serve" else _send(args)
+        if args.mode == "serve":
+            return _serve(args)
+        if args.mode == "shutdown":
+            return _shutdown(args)
+        return _send(args)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     return 2

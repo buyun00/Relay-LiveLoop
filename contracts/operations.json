@@ -1,7 +1,7 @@
 {
   "protocolVersion": 1,
   "transports": {
-    "http": ["GET /status", "GET /capabilities", "POST /commands", "GET /jobs/{id}", "GET /artifacts/{id}"],
+    "http": ["GET /status", "GET /capabilities", "POST /commands", "POST /lifecycle/shutdown", "GET /jobs/{id}", "GET /artifacts/{id}"],
     "cli": "relay-liveloop <operation> [arguments] --json",
     "mcpPrefix": "relay_liveloop_"
   },
@@ -29,4 +29,3 @@
     { "name": "job.cancel", "requiredArguments": ["jobId"], "effect": "job", "result": "cancelRequestedOrSafeResult" }
   ]
 }
-

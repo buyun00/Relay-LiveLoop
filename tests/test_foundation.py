@@ -262,7 +262,10 @@ class HTTPAndCLITests(unittest.TestCase):
         client = RelayHTTPClient(self.base_url, self.token)
         status = client.status()
         self.assertEqual("Relay LiveLoop", status["service"])
-        self.assertTrue(all(not item["available"] for item in client.capabilities()["capabilities"]))
+        self.assertEqual("preserve", status["hostLifecycle"]["playerPolicy"])
+        capabilities = client.capabilities()
+        self.assertTrue(all(not item["available"] for item in capabilities["capabilities"]))
+        self.assertTrue(capabilities["hostLifecycle"]["available"])
         with self.assertRaises(RelayHTTPError) as unauthorized:
             RelayHTTPClient(self.base_url, "wrong-token").status()
         self.assertEqual(401, unauthorized.exception.status)

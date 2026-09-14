@@ -5,6 +5,7 @@ Relay LiveLoop keeps stable orchestration code separate from application modules
 | Provider | Input | Output and required behavior |
 | --- | --- | --- |
 | Command service | operation, request ID, task ID, arguments, caller identity | One idempotent result or job ID; transport adapters do not duplicate orchestration |
+| Host lifecycle | authenticated graceful request, wait policy, preserve-Player assertion | Explicit active and non-interruptible jobs; drains new work and exits only when the durable ledger is safe |
 | Editor job provider | job ID, kind, immutable input snapshot, provider ID, artifact root | Persisted stage, diagnostics, and content-addressed artifacts |
 | Compile provider | build target, defines, references, immutable source input | Candidate assemblies, diagnostics, elapsed time, and exact configuration; never substitutes an older artifact after failure |
 | Asset build provider | immutable inputs and affected asset identifiers | Complete candidate release and dependency set; preparation does not activate it |
@@ -17,4 +18,3 @@ Relay LiveLoop keeps stable orchestration code separate from application modules
 | Evidence provider | task, plan, target generation, assertions | Fresh frame, state, input, and check artifacts; absent evidence remains absent |
 
 Stable contracts must not keep runtime `Type`, delegate, task, socket, token, or engine object references from a replaceable module. Serialized context is versioned plain data.
-

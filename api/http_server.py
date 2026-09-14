@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -27,7 +28,27 @@ class RelayHTTPServer(ThreadingHTTPServer):
             raise ValueError("Relay LiveLoop HTTP must bind to a loopback address.")
         self.service = service
         self.bearer_token = bearer_token
+        self._lifecycle_shutdown_lock = threading.Lock()
+        self._lifecycle_shutdown_started = False
         super().__init__(server_address, RelayRequestHandler)
+
+    def schedule_graceful_shutdown(self) -> None:
+        with self._lifecycle_shutdown_lock:
+            if self._lifecycle_shutdown_started:
+                return
+            self._lifecycle_shutdown_started = True
+        threading.Thread(
+            target=self._shutdown_when_safe,
+            name="relay-liveloop-graceful-shutdown",
+            daemon=True,
+        ).start()
+
+    def _shutdown_when_safe(self) -> None:
+        while self.service.lifecycle.is_draining():
+            if self.service.lifecycle.safe_to_exit():
+                self.shutdown()
+                return
+            threading.Event().wait(0.05)
 
 
 class RelayRequestHandler(BaseHTTPRequestHandler):
@@ -147,7 +168,7 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         path = urlsplit(self.path).path
-        if path != "/commands":
+        if path not in {"/commands", "/lifecycle/shutdown"}:
             self._error(HTTPStatus.NOT_FOUND, CommandError("CONTRACT_MISMATCH", "Unknown HTTP route.", stage="http"))
             return
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -163,11 +184,23 @@ class RelayRequestHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, CommandError("CONTRACT_MISMATCH", "Command body size is missing or out of range.", stage="http"))
             return
         try:
-            command = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._error(HTTPStatus.BAD_REQUEST, CommandError("CONTRACT_MISMATCH", "Command body is not valid UTF-8 JSON.", stage="http"))
             return
-        response = self.server.service.execute(command)
+        if path == "/lifecycle/shutdown":
+            response, should_schedule = self.server.service.request_shutdown(payload)
+            error_code = (response.get("error") or {}).get("code")
+            status = HTTPStatus.ACCEPTED if response["status"] == "accepted" else HTTPStatus.BAD_REQUEST
+            if error_code == "CONFLICT":
+                status = HTTPStatus.CONFLICT
+            try:
+                self._send_json(status, response)
+            finally:
+                if should_schedule:
+                    self.server.schedule_graceful_shutdown()
+            return
+        response = self.server.service.execute(payload)
         error_code = (response.get("error") or {}).get("code")
         status = HTTPStatus.OK
         if error_code == "AUTH_REQUIRED":
