@@ -78,6 +78,7 @@ namespace RelayLiveLoop
             _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
             _dispatcher.AssertMainThread();
             _limits = limits ?? new RuntimeBridgeLimits();
+            RuntimeRevisions = identity.BindRuntimeRevisionAuthority(dispatcher);
             Authentication = new SessionAuthentication(identity, sharedSecret);
             Framer = new BoundedMessageFramer(_limits.MaximumMessageBytes);
             ObjectHandles = new ObjectHandleRegistry(identity, dispatcher);
@@ -88,7 +89,20 @@ namespace RelayLiveLoop
         public BoundedMessageFramer Framer { get; private set; }
         public ObjectHandleRegistry ObjectHandles { get; private set; }
         public ProviderRegistry Providers { get; private set; }
+        public RuntimeRevisionClock RuntimeRevisions { get; private set; }
         public RuntimeSessionIdentity Identity { get { return _identity; } }
+
+        public RelayLiveLoopResult<RuntimeRevisionTransition> PublishAuthorizedCompletedRuntimeTransition(
+            string operationId,
+            string expectedRuntimeRevision,
+            string runtimeRevisionAfter)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(RuntimeBridgeCore));
+            return RuntimeRevisions.PublishAuthorizedCompletedTransition(
+                operationId,
+                expectedRuntimeRevision,
+                runtimeRevisionAfter);
+        }
 
         public Task<RelayLiveLoopResult> ScheduleAuthenticated(
             AuthenticatedRuntimeRequest request,
@@ -118,10 +132,10 @@ namespace RelayLiveLoop
                 return FailureTask(RelayLiveLoopErrorCode.WrongSession, "validate_request", "Request targets another Player session.", false);
             }
 
-            if (!string.Equals(request.ExpectedRuntimeRevision, _identity.RuntimeRevision, StringComparison.Ordinal))
-            {
-                return FailureTask(RelayLiveLoopErrorCode.InputChanged, "validate_request", "Runtime revision changed before dispatch.", true);
-            }
+            var revision = RuntimeRevisions.CaptureIfCurrent(
+                request.ExpectedRuntimeRevision,
+                "validate_request");
+            if (!revision.Succeeded) return FailureTask(revision.Error);
 
             var payloadHash = SessionAuthentication.ComputeSha256(request.Payload);
             if (!string.Equals(payloadHash, request.Authentication.PayloadSha256, StringComparison.OrdinalIgnoreCase))
@@ -161,7 +175,7 @@ namespace RelayLiveLoop
 
                 var task = _dispatcher.Schedule(
                     request.Authentication.RequestId,
-                    () => mainThreadHandler(request),
+                    () => ExecuteOnMainThread(request, mainThreadHandler),
                     _limits.MainThreadTimeout,
                     cancellationToken);
                 _requests.Add(request.Authentication.RequestId, new TrackedRequest
@@ -190,6 +204,18 @@ namespace RelayLiveLoop
             _disposed = true;
         }
 
+        private RelayLiveLoopResult ExecuteOnMainThread(
+            AuthenticatedRuntimeRequest request,
+            Func<AuthenticatedRuntimeRequest, RelayLiveLoopResult> mainThreadHandler)
+        {
+            _dispatcher.AssertMainThread();
+            var revision = RuntimeRevisions.CaptureIfCurrent(
+                request.ExpectedRuntimeRevision,
+                "main_thread_execute");
+            if (!revision.Succeeded) return RelayLiveLoopResult.Failure(revision.Error);
+            return mainThreadHandler(request);
+        }
+
         private void TrimTrackedRequests()
         {
             while (_requests.Count >= _limits.MaximumTrackedRequests && _requestOrder.Count > 0)
@@ -208,14 +234,18 @@ namespace RelayLiveLoop
             }
         }
 
+        private static Task<RelayLiveLoopResult> FailureTask(RelayLiveLoopError error)
+        {
+            return Task.FromResult(RelayLiveLoopResult.Failure(error));
+        }
+
         private static Task<RelayLiveLoopResult> FailureTask(
             RelayLiveLoopErrorCode code,
             string stage,
             string message,
             bool recoverable)
         {
-            return Task.FromResult(RelayLiveLoopResult.Failure(
-                RelayLiveLoopErrors.Create(code, stage, message, recoverable)));
+            return FailureTask(RelayLiveLoopErrors.Create(code, stage, message, recoverable));
         }
     }
 }

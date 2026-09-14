@@ -105,6 +105,8 @@ namespace RelayLiveLoop
 
             return RelayLiveLoopResult<ComponentPropertyObservation>.Success(new ComponentPropertyObservation
             {
+                SessionId = _identity.SessionId,
+                RuntimeRevision = _identity.RuntimeRevision,
                 Component = component,
                 Property = property,
                 Value = value,

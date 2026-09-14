@@ -114,6 +114,8 @@ namespace RelayLiveLoop
 
     public sealed class ComponentPropertyObservation
     {
+        public string SessionId { get; set; }
+        public string RuntimeRevision { get; set; }
         public RuntimeObjectHandle Component { get; set; }
         public string Property { get; set; }
         public ComponentValue Value { get; set; }
@@ -173,6 +175,7 @@ namespace RelayLiveLoop
         public int Width { get; set; }
         public int Height { get; set; }
         public bool Fresh { get; set; }
+        public string RuntimeRevision { get; set; }
     }
 
     public interface IRuntimeObservationProvider

@@ -51,7 +51,7 @@ try {
         'RelayLiveLoopEditorWorker.cs',
         'RelayLiveLoopEditorWorkerBootstrap.cs'
     )
-    $runtimeNames = $baseRuntimeNames + @('NeutralProviderContracts.cs', 'RuntimeProviderHub.cs')
+    $runtimeNames = $baseRuntimeNames + @('NeutralProviderContracts.cs', 'RuntimeProviderHub.cs', 'RuntimeRevisionClock.cs')
     $editorNames = $baseEditorNames + @('NeutralEditorProviderContracts.cs', 'NeutralEditorProviderHub.cs')
     $runtimeSources = @($runtimeNames | ForEach-Object { Join-Path $packageRoot "Runtime\Core\$_" })
     $editorSources = @($editorNames | ForEach-Object { Join-Path $packageRoot "Editor\Core\$_" })

@@ -61,78 +61,267 @@ namespace RelayLiveLoop
         {
             if (execution == null || execution.Request == null)
             {
-                return ImmediateFailure("INVALID_REQUEST", "editor_provider_dispatch", "Editor job request is missing.", false);
+                return ImmediateFailure(
+                    "INVALID_REQUEST",
+                    "editor_provider_dispatch",
+                    "Editor job request is missing.",
+                    false,
+                    true,
+                    false);
             }
 
-            try
+            switch (execution.Request.kind)
             {
-                switch (execution.Request.kind)
-                {
-                    case "compile":
-                        if (_compile == null) return CapabilityUnavailable("compile");
-                        var compilePayload = Parse<CompileJobPayload>(execution.Request.payloadJson);
-                        var compileError = ValidateCompile(compilePayload);
-                        return compileError ?? _compile.BeginCompile(compilePayload, execution) ??
-                            ImmediateFailure("CONTRACT_MISMATCH", "compile", "Compile provider returned no operation.", false);
-                    case "asset.build":
-                        if (_asset == null) return CapabilityUnavailable("asset.build");
-                        var assetPayload = Parse<AssetBuildJobPayload>(execution.Request.payloadJson);
-                        var assetError = ValidateAsset(assetPayload);
-                        return assetError ?? _asset.BeginAssetBuild(assetPayload, execution) ??
-                            ImmediateFailure("CONTRACT_MISMATCH", "asset.build", "Asset provider returned no operation.", false);
-                    case "source.locate":
-                        if (_source == null) return CapabilityUnavailable("source.locate");
-                        var locatePayload = Parse<SourceJobPayload>(execution.Request.payloadJson);
-                        var locateError = ValidateSource(locatePayload, false);
-                        return locateError ?? _source.BeginLocate(locatePayload, execution) ??
-                            ImmediateFailure("CONTRACT_MISMATCH", "source.locate", "Source provider returned no operation.", false);
-                    case "source.edit":
-                        if (_source == null) return CapabilityUnavailable("source.edit");
-                        var editPayload = Parse<SourceJobPayload>(execution.Request.payloadJson);
-                        var editError = ValidateSource(editPayload, true);
-                        return editError ?? _source.BeginEdit(editPayload, execution) ??
-                            ImmediateFailure("CONTRACT_MISMATCH", "source.edit", "Source provider returned no operation.", false);
-                    default:
-                        return ImmediateFailure("CAPABILITY_UNAVAILABLE", "editor_provider_dispatch", "Editor job kind is not supported.", true);
-                }
-            }
-            catch (Exception ex)
-            {
-                return ImmediateFailure("CONTRACT_MISMATCH", "editor_provider_dispatch", ex.GetType().Name + ": " + ex.Message, false);
+                case "compile":
+                    return BeginCompile(execution);
+                case "asset.build":
+                    return BeginAssetBuild(execution);
+                case "source.locate":
+                    return BeginSourceLocate(execution);
+                case "source.edit":
+                    return BeginSourceEdit(execution);
+                default:
+                    return ImmediateFailure(
+                        "CAPABILITY_UNAVAILABLE",
+                        "editor_provider_dispatch",
+                        "Editor job kind is not supported.",
+                        true,
+                        true,
+                        false);
             }
         }
 
         public IEditorJobOperation Recover(EditorJobExecution execution)
         {
             if (execution == null || execution.Request == null) return null;
+            switch (execution.Request.kind)
+            {
+                case "compile":
+                    return RecoverCompile(execution);
+                case "asset.build":
+                    return RecoverAssetBuild(execution);
+                case "source.locate":
+                    return RecoverSourceLocate(execution);
+                case "source.edit":
+                    return RecoverSourceEdit(execution);
+                default:
+                    return null;
+            }
+        }
+
+        private IEditorJobOperation BeginCompile(EditorJobExecution execution)
+        {
+            CompileJobPayload payload;
+            IEditorJobOperation validation;
+            if (!TryParseAndValidate(
+                execution.Request.payloadJson,
+                "compile",
+                ValidateCompile,
+                out payload,
+                out validation)) return validation;
+            if (_compile == null) return CapabilityUnavailable("compile");
+            return InvokeBegin(
+                "COMPILE_FAILED",
+                "compile",
+                true,
+                () => _compile.BeginCompile(payload, execution));
+        }
+
+        private IEditorJobOperation BeginAssetBuild(EditorJobExecution execution)
+        {
+            AssetBuildJobPayload payload;
+            IEditorJobOperation validation;
+            if (!TryParseAndValidate(
+                execution.Request.payloadJson,
+                "asset.build",
+                ValidateAsset,
+                out payload,
+                out validation)) return validation;
+            if (_asset == null) return CapabilityUnavailable("asset.build");
+            return InvokeBegin(
+                "RESOURCE_BUILD_FAILED",
+                "asset.build",
+                true,
+                () => _asset.BeginAssetBuild(payload, execution));
+        }
+
+        private IEditorJobOperation BeginSourceLocate(EditorJobExecution execution)
+        {
+            SourceJobPayload payload;
+            IEditorJobOperation validation;
+            if (!TryParseAndValidate(
+                execution.Request.payloadJson,
+                "source.locate",
+                value => ValidateSource(value, false),
+                out payload,
+                out validation)) return validation;
+            if (_source == null) return CapabilityUnavailable("source.locate");
+            return InvokeBegin(
+                "INTERNAL_ERROR",
+                "source.locate",
+                true,
+                () => _source.BeginLocate(payload, execution));
+        }
+
+        private IEditorJobOperation BeginSourceEdit(EditorJobExecution execution)
+        {
+            SourceJobPayload payload;
+            IEditorJobOperation validation;
+            if (!TryParseAndValidate(
+                execution.Request.payloadJson,
+                "source.edit",
+                value => ValidateSource(value, true),
+                out payload,
+                out validation)) return validation;
+            if (_source == null) return CapabilityUnavailable("source.edit");
+            return InvokeBegin(
+                "STATE_UNKNOWN",
+                "source.edit",
+                false,
+                () => _source.BeginEdit(payload, execution));
+        }
+
+        private IEditorJobOperation RecoverCompile(EditorJobExecution execution)
+        {
+            CompileJobPayload payload;
+            IEditorJobOperation validation;
+            if (!TryParseAndValidate(
+                execution.Request.payloadJson,
+                "compile",
+                ValidateCompile,
+                out payload,
+                out validation)) return validation;
+            if (_compile == null) return null;
+            return InvokeRecovery("compile", () => _compile.RecoverCompile(payload, execution));
+        }
+
+        private IEditorJobOperation RecoverAssetBuild(EditorJobExecution execution)
+        {
+            AssetBuildJobPayload payload;
+            IEditorJobOperation validation;
+            if (!TryParseAndValidate(
+                execution.Request.payloadJson,
+                "asset.build",
+                ValidateAsset,
+                out payload,
+                out validation)) return validation;
+            if (_asset == null) return null;
+            return InvokeRecovery("asset.build", () => _asset.RecoverAssetBuild(payload, execution));
+        }
+
+        private IEditorJobOperation RecoverSourceLocate(EditorJobExecution execution)
+        {
+            SourceJobPayload payload;
+            IEditorJobOperation validation;
+            if (!TryParseAndValidate(
+                execution.Request.payloadJson,
+                "source.locate",
+                value => ValidateSource(value, false),
+                out payload,
+                out validation)) return validation;
+            if (_source == null) return null;
+            return InvokeRecovery("source.locate", () => _source.RecoverLocate(payload, execution));
+        }
+
+        private IEditorJobOperation RecoverSourceEdit(EditorJobExecution execution)
+        {
+            SourceJobPayload payload;
+            IEditorJobOperation validation;
+            if (!TryParseAndValidate(
+                execution.Request.payloadJson,
+                "source.edit",
+                value => ValidateSource(value, true),
+                out payload,
+                out validation)) return validation;
+            if (_source == null) return null;
+            return InvokeRecovery("source.edit", () => _source.RecoverEdit(payload, execution));
+        }
+
+        private static IEditorJobOperation InvokeBegin(
+            string failureCode,
+            string stage,
+            bool runtimeChangedKnown,
+            Func<IEditorJobOperation> invoke)
+        {
             try
             {
-                switch (execution.Request.kind)
+                var operation = invoke();
+                if (operation != null)
                 {
-                    case "compile":
-                        return _compile == null
-                            ? null
-                            : _compile.RecoverCompile(Parse<CompileJobPayload>(execution.Request.payloadJson), execution);
-                    case "asset.build":
-                        return _asset == null
-                            ? null
-                            : _asset.RecoverAssetBuild(Parse<AssetBuildJobPayload>(execution.Request.payloadJson), execution);
-                    case "source.locate":
-                        return _source == null
-                            ? null
-                            : _source.RecoverLocate(Parse<SourceJobPayload>(execution.Request.payloadJson), execution);
-                    case "source.edit":
-                        return _source == null
-                            ? null
-                            : _source.RecoverEdit(Parse<SourceJobPayload>(execution.Request.payloadJson), execution);
-                    default:
-                        return null;
+                    return new ClassifiedEditorJobOperation(
+                        operation,
+                        failureCode,
+                        stage,
+                        runtimeChangedKnown);
                 }
+                return ImmediateFailure(
+                    failureCode,
+                    stage,
+                    "Provider returned no operation after it was entered.",
+                    false,
+                    runtimeChangedKnown,
+                    false);
             }
-            catch
+            catch (Exception ex)
             {
-                // Recovery must not turn an unreadable or ambiguous prior attempt into a new run.
-                return null;
+                return ImmediateFailure(
+                    failureCode,
+                    stage,
+                    ex.GetType().Name + ": " + ex.Message,
+                    false,
+                    runtimeChangedKnown,
+                    false);
+            }
+        }
+
+        private static IEditorJobOperation InvokeRecovery(
+            string stage,
+            Func<IEditorJobOperation> invoke)
+        {
+            try
+            {
+                var operation = invoke();
+                return operation == null
+                    ? null
+                    : new ClassifiedEditorJobOperation(
+                        operation,
+                        "STATE_UNKNOWN",
+                        stage,
+                        false);
+            }
+            catch (Exception ex)
+            {
+                return ImmediateFailure(
+                    "STATE_UNKNOWN",
+                    stage,
+                    ex.GetType().Name + ": " + ex.Message,
+                    false,
+                    false,
+                    false);
+            }
+        }
+
+        private static bool TryParseAndValidate<T>(
+            string json,
+            string stage,
+            Func<T, string> validate,
+            out T payload,
+            out IEditorJobOperation failure) where T : class
+        {
+            payload = null;
+            failure = null;
+            try
+            {
+                payload = Parse<T>(json);
+                var problem = validate(payload);
+                if (problem == null) return true;
+                failure = ContractMismatch(stage, problem);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                failure = ContractMismatch(stage, ex.GetType().Name + ": " + ex.Message);
+                return false;
             }
         }
 
@@ -144,38 +333,49 @@ namespace RelayLiveLoop
             return value;
         }
 
-        private static IEditorJobOperation ValidateCompile(CompileJobPayload payload)
+        private static string ValidateCompile(CompileJobPayload payload)
         {
             if (string.IsNullOrWhiteSpace(payload.buildTarget) || string.IsNullOrWhiteSpace(payload.configuration) ||
                 payload.sourceInputs == null || payload.sourceInputs.Count == 0 || payload.sourceInputs.Count > 4096 ||
                 payload.defines == null || payload.defines.Count > 1024 ||
                 payload.references == null || payload.references.Count > 4096)
             {
-                return ImmediateFailure("INVALID_REQUEST", "compile", "Compile payload is incomplete or exceeds bounds.", false);
+                return "Compile payload shape is incomplete or exceeds bounds.";
             }
             return null;
         }
 
-        private static IEditorJobOperation ValidateAsset(AssetBuildJobPayload payload)
+        private static string ValidateAsset(AssetBuildJobPayload payload)
         {
             if (string.IsNullOrWhiteSpace(payload.packageId) || string.IsNullOrWhiteSpace(payload.buildProfileId) ||
                 payload.affectedAssetIds == null || payload.affectedAssetIds.Count == 0 ||
                 payload.affectedAssetIds.Count > 10000)
             {
-                return ImmediateFailure("INVALID_REQUEST", "asset.build", "Asset build payload is incomplete or exceeds bounds.", false);
+                return "Asset build payload shape is incomplete or exceeds bounds.";
             }
             return null;
         }
 
-        private static IEditorJobOperation ValidateSource(SourceJobPayload payload, bool edit)
+        private static string ValidateSource(SourceJobPayload payload, bool edit)
         {
             if (string.IsNullOrWhiteSpace(payload.sourceGuid) || payload.localId < 0 ||
                 string.IsNullOrWhiteSpace(payload.propertyPath) ||
                 (edit && (payload.expectedValueJson == null || payload.replacementValueJson == null)))
             {
-                return ImmediateFailure("INVALID_REQUEST", edit ? "source.edit" : "source.locate", "Source payload is incomplete.", false);
+                return "Source payload shape is incomplete.";
             }
             return null;
+        }
+
+        private static IEditorJobOperation ContractMismatch(string stage, string message)
+        {
+            return ImmediateFailure(
+                "CONTRACT_MISMATCH",
+                stage,
+                message,
+                false,
+                true,
+                false);
         }
 
         private static IEditorJobOperation CapabilityUnavailable(string stage)
@@ -184,17 +384,29 @@ namespace RelayLiveLoop
                 "CAPABILITY_UNAVAILABLE",
                 stage,
                 "The required project adapter is not registered.",
-                true);
+                true,
+                true,
+                false);
         }
 
         private static IEditorJobOperation ImmediateFailure(
             string code,
             string stage,
             string message,
-            bool recoverable)
+            bool recoverable,
+            bool runtimeChangedKnown,
+            bool runtimeChanged)
         {
             return new ImmediateEditorJobOperation(EditorJobPollResult.Failed(
-                AtomicEditorJobStore.Error(code, stage, message, recoverable)));
+                new EditorJobError
+                {
+                    code = code,
+                    stage = stage,
+                    message = message,
+                    recoverable = recoverable,
+                    runtimeChangedKnown = runtimeChangedKnown,
+                    runtimeChanged = runtimeChanged
+                }));
         }
 
         private void Unregister(ProviderSlot slot, object expected)
@@ -247,6 +459,53 @@ namespace RelayLiveLoop
             public EditorJobPollResult Poll(TimeSpan mainThreadBudget)
             {
                 return _result;
+            }
+        }
+
+        private sealed class ClassifiedEditorJobOperation : IEditorJobOperation
+        {
+            private readonly IEditorJobOperation _inner;
+            private readonly string _failureCode;
+            private readonly string _stage;
+            private readonly bool _runtimeChangedKnown;
+
+            public ClassifiedEditorJobOperation(
+                IEditorJobOperation inner,
+                string failureCode,
+                string stage,
+                bool runtimeChangedKnown)
+            {
+                _inner = inner;
+                _failureCode = failureCode;
+                _stage = stage;
+                _runtimeChangedKnown = runtimeChangedKnown;
+            }
+
+            public EditorJobPollResult Poll(TimeSpan mainThreadBudget)
+            {
+                try
+                {
+                    var result = _inner.Poll(mainThreadBudget);
+                    if (result != null) return result;
+                    return Failed("Provider returned no poll result after it was entered.");
+                }
+                catch (Exception ex)
+                {
+                    return Failed(ex.GetType().Name + ": " + ex.Message);
+                }
+            }
+
+            private EditorJobPollResult Failed(string message)
+            {
+                return EditorJobPollResult.Failed(new EditorJobError
+                {
+                    code = _failureCode,
+                    stage = _stage,
+                    message = message,
+                    recoverable = false,
+                    runtimeChangedKnown = _runtimeChangedKnown,
+                    runtimeChanged = false
+                });
             }
         }
     }

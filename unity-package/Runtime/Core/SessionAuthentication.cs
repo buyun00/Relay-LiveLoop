@@ -9,6 +9,8 @@ namespace RelayLiveLoop
 {
     public sealed class RuntimeSessionIdentity
     {
+        private readonly RuntimeRevisionClock _runtimeRevisions;
+
         public RuntimeSessionIdentity(
             string sessionId,
             string launchId,
@@ -17,15 +19,23 @@ namespace RelayLiveLoop
         {
             SessionId = RequireCanonicalValue(sessionId, nameof(sessionId));
             LaunchId = RequireCanonicalValue(launchId, nameof(launchId));
-            RuntimeRevision = RequireCanonicalValue(runtimeRevision, nameof(runtimeRevision));
+            _runtimeRevisions = new RuntimeRevisionClock(runtimeRevision);
             if (protocolVersion <= 0) throw new ArgumentOutOfRangeException(nameof(protocolVersion));
             ProtocolVersion = protocolVersion;
         }
 
         public string SessionId { get; private set; }
         public string LaunchId { get; private set; }
-        public string RuntimeRevision { get; private set; }
+        public string RuntimeRevision { get { return _runtimeRevisions.CurrentRevision; } }
+        public IRuntimeRevisionSource RuntimeRevisions { get { return _runtimeRevisions; } }
         public int ProtocolVersion { get; private set; }
+
+        internal RuntimeRevisionClock BindRuntimeRevisionAuthority(
+            IRelayLiveLoopMainThreadGuard mainThread)
+        {
+            _runtimeRevisions.BindMainThreadAuthority(mainThread);
+            return _runtimeRevisions;
+        }
 
         internal static string RequireCanonicalValue(string value, string parameterName)
         {
@@ -46,17 +56,20 @@ namespace RelayLiveLoop
             string challengeId,
             string clientNonce,
             string serverNonce,
+            string runtimeRevision,
             DateTimeOffset expiresAtUtc)
         {
             ChallengeId = challengeId;
             ClientNonce = clientNonce;
             ServerNonce = serverNonce;
+            RuntimeRevision = runtimeRevision;
             ExpiresAtUtc = expiresAtUtc;
         }
 
         public string ChallengeId { get; private set; }
         public string ClientNonce { get; private set; }
         public string ServerNonce { get; private set; }
+        public string RuntimeRevision { get; private set; }
         public DateTimeOffset ExpiresAtUtc { get; private set; }
     }
 
@@ -198,14 +211,12 @@ namespace RelayLiveLoop
                             false));
                 }
 
-                if (!string.Equals(expectedRuntimeRevision, _identity.RuntimeRevision, StringComparison.Ordinal))
+                var revision = _identity.RuntimeRevisions.CaptureIfCurrent(
+                    expectedRuntimeRevision,
+                    "handshake");
+                if (!revision.Succeeded)
                 {
-                    return RelayLiveLoopResult<HandshakeChallenge>.Failure(
-                        RelayLiveLoopErrors.Create(
-                            RelayLiveLoopErrorCode.InputChanged,
-                            "handshake",
-                            "Runtime revision changed before the handshake.",
-                            true));
+                    return RelayLiveLoopResult<HandshakeChallenge>.Failure(revision.Error);
                 }
 
                 if (_challenges.Count >= _maximumOutstandingChallenges)
@@ -218,6 +229,7 @@ namespace RelayLiveLoop
                     RandomToken(24),
                     clientNonce,
                     RandomToken(32),
+                    revision.Value,
                     now.Add(_challengeLifetime));
                 _challenges.Add(challenge.ChallengeId, challenge);
                 return RelayLiveLoopResult<HandshakeChallenge>.Success(challenge);
@@ -239,6 +251,14 @@ namespace RelayLiveLoop
                 }
 
                 _challenges.Remove(challengeId);
+                var current = _identity.RuntimeRevisions.CaptureIfCurrent(
+                    challenge.RuntimeRevision,
+                    "handshake");
+                if (!current.Succeeded)
+                {
+                    return RelayLiveLoopResult<AuthenticatedConnection>.Failure(current.Error);
+                }
+
                 var expected = ComputeHandshakeProof(_sharedSecret, _identity, challenge);
                 if (!FixedTimeBase64Equals(expected, proof))
                 {
@@ -414,7 +434,7 @@ namespace RelayLiveLoop
                 identity.ProtocolVersion.ToString(CultureInfo.InvariantCulture),
                 identity.SessionId,
                 identity.LaunchId,
-                identity.RuntimeRevision,
+                challenge.RuntimeRevision,
                 challenge.ChallengeId,
                 challenge.ClientNonce,
                 challenge.ServerNonce

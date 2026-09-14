@@ -105,6 +105,16 @@ namespace RelayLiveLoop
                 yield break;
             }
 
+            var revision = _identity.RuntimeRevisions.CaptureIfCurrent(
+                request.ExpectedRuntimeRevision,
+                "capture_frame_pixels");
+            if (!revision.Succeeded)
+            {
+                Interlocked.Exchange(ref _busy, 0);
+                completion.TrySetResult(RelayLiveLoopResult<FreshFrameArtifact>.Failure(revision.Error));
+                yield break;
+            }
+
             Texture2D texture = null;
             Color32[] pixels;
             int width;
@@ -157,6 +167,7 @@ namespace RelayLiveLoop
                     height,
                     capturedFrame,
                     request.MinimumFrameExclusive,
+                    revision.Value,
                     pixels,
                     cancellationToken));
             while (!writer.IsCompleted) yield return null;
@@ -191,10 +202,10 @@ namespace RelayLiveLoop
                 return Error(RelayLiveLoopErrorCode.WrongSession, "capture_frame", "Capture targets another Player session.", false);
             }
 
-            if (!string.Equals(request.ExpectedRuntimeRevision, _identity.RuntimeRevision, StringComparison.Ordinal))
-            {
-                return Error(RelayLiveLoopErrorCode.InputChanged, "capture_frame", "Runtime revision changed before capture.", true);
-            }
+            var revision = _identity.RuntimeRevisions.CaptureIfCurrent(
+                request.ExpectedRuntimeRevision,
+                "capture_frame");
+            if (!revision.Succeeded) return revision.Error;
 
             if (request.MinimumFrameExclusive < 0 || request.MaximumWidth <= 0 || request.MaximumHeight <= 0 ||
                 request.MaximumWidth > 8192 || request.MaximumHeight > 8192 || request.Timeout <= TimeSpan.Zero ||
@@ -218,6 +229,7 @@ namespace RelayLiveLoop
             int height,
             long capturedFrame,
             long minimumFrameExclusive,
+            string runtimeRevision,
             Color32[] pixels,
             CancellationToken cancellationToken)
         {
@@ -259,7 +271,8 @@ namespace RelayLiveLoop
                     Frame = capturedFrame,
                     Width = width,
                     Height = height,
-                    Fresh = capturedFrame > minimumFrameExclusive
+                    Fresh = capturedFrame > minimumFrameExclusive,
+                    RuntimeRevision = runtimeRevision
                 });
             }
             catch (Exception ex)

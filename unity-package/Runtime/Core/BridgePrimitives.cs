@@ -1,6 +1,7 @@
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 
 namespace RelayLiveLoop
 {
@@ -28,6 +29,8 @@ namespace RelayLiveLoop
 
     public sealed class RelayLiveLoopError
     {
+        private readonly IReadOnlyDictionary<string, string> _details;
+
         public RelayLiveLoopError(
             RelayLiveLoopErrorCode code,
             string stage,
@@ -35,6 +38,18 @@ namespace RelayLiveLoop
             bool? runtimeChanged,
             bool recoverable,
             IReadOnlyList<string> evidence)
+            : this(code, stage, message, runtimeChanged, recoverable, evidence, null)
+        {
+        }
+
+        public RelayLiveLoopError(
+            RelayLiveLoopErrorCode code,
+            string stage,
+            string message,
+            bool? runtimeChanged,
+            bool recoverable,
+            IReadOnlyList<string> evidence,
+            IReadOnlyDictionary<string, string> details)
         {
             Code = code;
             Stage = stage ?? string.Empty;
@@ -42,6 +57,10 @@ namespace RelayLiveLoop
             RuntimeChanged = runtimeChanged;
             Recoverable = recoverable;
             Evidence = evidence ?? Array.Empty<string>();
+            _details = new ReadOnlyDictionary<string, string>(
+                details == null
+                    ? new Dictionary<string, string>(StringComparer.Ordinal)
+                    : new Dictionary<string, string>(details, StringComparer.Ordinal));
         }
 
         public RelayLiveLoopErrorCode Code { get; private set; }
@@ -50,6 +69,7 @@ namespace RelayLiveLoop
         public bool? RuntimeChanged { get; private set; }
         public bool Recoverable { get; private set; }
         public IReadOnlyList<string> Evidence { get; private set; }
+        public IReadOnlyDictionary<string, string> Details { get { return _details; } }
     }
 
     public class RelayLiveLoopResult
@@ -104,7 +124,8 @@ namespace RelayLiveLoop
             string stage,
             string message,
             bool recoverable,
-            bool? runtimeChanged = false)
+            bool? runtimeChanged = false,
+            IReadOnlyDictionary<string, string> details = null)
         {
             return new RelayLiveLoopError(
                 code,
@@ -112,7 +133,8 @@ namespace RelayLiveLoop
                 message,
                 runtimeChanged,
                 recoverable,
-                Array.Empty<string>());
+                Array.Empty<string>(),
+                details);
         }
     }
 }

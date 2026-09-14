@@ -1,6 +1,7 @@
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using UnityEngine;
 
 namespace RelayLiveLoop
@@ -177,12 +178,19 @@ namespace RelayLiveLoop
 
             if (!current.EquivalentTo(overlay.Applied))
             {
+                var details = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    { "externalDrift", "true" },
+                    { "expectedAppliedValue", Describe(overlay.Applied) },
+                    { "observedCurrentValue", Describe(current) }
+                };
                 return Failure<ComponentRevertResult>(
                     RelayLiveLoopErrorCode.InputChanged,
                     "component_revert",
                     "Current value changed after preview; revert will not overwrite it.",
                     true,
-                    true);
+                    false,
+                    details);
             }
 
             if (!BuiltinComponentPropertyAccess.TryWrite(resolved.Value, overlay.Property, overlay.Original))
@@ -240,12 +248,48 @@ namespace RelayLiveLoop
             _overlays.Clear();
         }
 
+        private static string Describe(ComponentValue value)
+        {
+            if (value == null) return "null";
+            switch (value.Kind)
+            {
+                case ComponentValueKind.Boolean:
+                    return "boolean:" + (value.BooleanValue ? "true" : "false");
+                case ComponentValueKind.Integer:
+                    return "integer:" + value.IntegerValue.ToString(CultureInfo.InvariantCulture);
+                case ComponentValueKind.Float:
+                    return "float:" + value.FloatValue.ToString("R", CultureInfo.InvariantCulture);
+                case ComponentValueKind.String:
+                    return "string:" + (value.StringValue ?? string.Empty);
+                case ComponentValueKind.Vector2:
+                    return "vector2:" + Join(value.X, value.Y);
+                case ComponentValueKind.Vector3:
+                    return "vector3:" + Join(value.X, value.Y, value.Z);
+                case ComponentValueKind.Quaternion:
+                    return "quaternion:" + Join(value.X, value.Y, value.Z, value.W);
+                default:
+                    return "unknown";
+            }
+        }
+
+        private static string Join(params double[] values)
+        {
+            var parts = new string[values.Length];
+            for (var index = 0; index < values.Length; index++)
+            {
+                parts[index] = values[index].ToString("R", CultureInfo.InvariantCulture);
+            }
+
+            return string.Join(",", parts);
+        }
+
         private static RelayLiveLoopResult<T> Failure<T>(
             RelayLiveLoopErrorCode code,
             string stage,
             string message,
             bool recoverable,
-            bool? runtimeChanged)
+            bool? runtimeChanged,
+            IReadOnlyDictionary<string, string> details = null)
         {
             return RelayLiveLoopResult<T>.Failure(new RelayLiveLoopError(
                 code,
@@ -253,7 +297,8 @@ namespace RelayLiveLoop
                 message,
                 runtimeChanged,
                 recoverable,
-                Array.Empty<string>()));
+                Array.Empty<string>(),
+                details));
         }
     }
 }

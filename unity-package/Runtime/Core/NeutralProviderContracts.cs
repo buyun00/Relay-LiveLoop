@@ -4,6 +4,13 @@ using System.Collections.Generic;
 
 namespace RelayLiveLoop
 {
+    internal interface IProviderRuntimeChangeReport
+    {
+        bool? RuntimeChanged { get; }
+        string RuntimeRevisionAfter { get; }
+        RuntimeRevisionTransition Transition { get; }
+    }
+
     public sealed class ProviderAddress
     {
         public RelayLiveLoopProviderKind Kind { get; set; }
@@ -21,14 +28,48 @@ namespace RelayLiveLoop
         public string Detail { get; set; }
     }
 
-    public sealed class ProviderReply<T>
+    public sealed class ProviderReply<T> : IProviderRuntimeChangeReport
     {
-        private readonly ProviderEvidence[] _evidence;
+        private ProviderEvidence[] _evidence;
 
         public ProviderReply(T value, bool? runtimeChanged, IReadOnlyList<ProviderEvidence> evidence)
         {
+            if (runtimeChanged == true)
+            {
+                throw new ArgumentException(
+                    "A provider may report a runtime change only with a completed revision transition receipt.",
+                    nameof(runtimeChanged));
+            }
+
             Value = value;
             RuntimeChanged = runtimeChanged;
+            CopyEvidence(evidence);
+        }
+
+        public ProviderReply(
+            T value,
+            RuntimeRevisionTransition transition,
+            IReadOnlyList<ProviderEvidence> evidence)
+        {
+            if (transition == null) throw new ArgumentNullException(nameof(transition));
+            Value = value;
+            RuntimeChanged = true;
+            RuntimeRevisionAfter = transition.RuntimeRevisionAfter;
+            RuntimeTransitionId = transition.OperationId;
+            Transition = transition;
+            CopyEvidence(evidence);
+        }
+
+        public T Value { get; private set; }
+        public bool? RuntimeChanged { get; private set; }
+        public string RuntimeRevisionAfter { get; private set; }
+        public string RuntimeTransitionId { get; private set; }
+        public IReadOnlyList<ProviderEvidence> Evidence { get { return _evidence; } }
+        internal RuntimeRevisionTransition Transition { get; private set; }
+        RuntimeRevisionTransition IProviderRuntimeChangeReport.Transition { get { return Transition; } }
+
+        private void CopyEvidence(IReadOnlyList<ProviderEvidence> evidence)
+        {
             if (evidence == null)
             {
                 _evidence = Array.Empty<ProviderEvidence>();
@@ -39,10 +80,6 @@ namespace RelayLiveLoop
                 for (var index = 0; index < evidence.Count; index++) _evidence[index] = evidence[index];
             }
         }
-
-        public T Value { get; private set; }
-        public bool? RuntimeChanged { get; private set; }
-        public IReadOnlyList<ProviderEvidence> Evidence { get { return _evidence; } }
     }
 
     public sealed class NeutralPayload

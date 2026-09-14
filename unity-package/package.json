@@ -1,6 +1,6 @@
 {
   "name": "com.relay.liveloop",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "displayName": "Relay LiveLoop",
   "description": "Generic Development Player and Unity Editor bridge primitives for evidence-based live iteration.",
   "unity": "2022.3",
