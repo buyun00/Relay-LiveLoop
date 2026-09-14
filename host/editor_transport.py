@@ -345,8 +345,25 @@ class EditorJobTransport:
         return validated
 
     @staticmethod
-    def _absolute_root(value: str | Path, name: str) -> Path:
-        path = Path(value)
+    def _absolute_root(value: Any, name: str) -> Path:
+        if not isinstance(value, (str, Path)):
+            raise CommandError(
+                "CONTRACT_MISMATCH",
+                f"{name} must be a string or Path.",
+                stage="validation",
+                runtime_changed=False,
+                recoverable=True,
+            )
+        try:
+            path = Path(value)
+        except (TypeError, ValueError) as exc:
+            raise CommandError(
+                "CONTRACT_MISMATCH",
+                f"{name} is not a valid path.",
+                stage="validation",
+                runtime_changed=False,
+                recoverable=True,
+            ) from exc
         if not path.is_absolute():
             raise CommandError(
                 "CONTRACT_MISMATCH",
@@ -355,7 +372,16 @@ class EditorJobTransport:
                 runtime_changed=False,
                 recoverable=True,
             )
-        return path.resolve()
+        try:
+            return path.resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise CommandError(
+                "CONTRACT_MISMATCH",
+                f"{name} cannot be normalized as an absolute path.",
+                stage="validation",
+                runtime_changed=False,
+                recoverable=True,
+            ) from exc
 
     @staticmethod
     def _is_contained(root: Path, candidate: Path) -> bool:
