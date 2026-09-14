@@ -468,6 +468,31 @@ class UpdateCoordinator:
             raise CommandError("CONTRACT_MISMATCH", "A failed runtime result requires an error object.", stage="runtime_reconcile")
         return dict(value)
 
+    @staticmethod
+    def _require_recovery_change_consistency(
+        plan: dict[str, Any],
+        normalized: dict[str, Any],
+        observed: dict[str, Any],
+    ) -> None:
+        if normalized["status"] != "completed":
+            return
+        observed_revision_changed = observed["runtimeRevision"] != plan["expectedRuntimeRevision"]
+        if normalized["runtimeChanged"] is observed_revision_changed:
+            return
+        raise CommandError(
+            "STATE_UNKNOWN",
+            "Completed reconciliation does not consistently attribute the observed runtime revision transition to the interrupted apply.",
+            stage="runtime_reconcile",
+            runtime_changed=None,
+            recoverable=False,
+            details={
+                "expectedRuntimeRevision": plan["expectedRuntimeRevision"],
+                "observedRuntimeRevision": observed["runtimeRevision"],
+                "observedRevisionChanged": observed_revision_changed,
+                "reportedRuntimeChanged": normalized["runtimeChanged"],
+            },
+        )
+
     def _record_apply_facts(
         self,
         task: dict[str, Any],
@@ -568,6 +593,7 @@ class UpdateCoordinator:
                         assert observed is not None
                         if normalized["runtimeRevisionAfter"] is not None and normalized["runtimeRevisionAfter"] != observed["runtimeRevision"]:
                             raise CommandError("STATE_UNKNOWN", "Reconciled result does not match the observed runtime revision.", stage="runtime_reconcile", runtime_changed=None, recoverable=False)
+                        self._require_recovery_change_consistency(plan, normalized, observed)
                         effective_facts = self._record_apply_facts(task, plan, normalized, observed)
                         for method_state in normalized["methodStates"]:
                             self.ledger.set_method_state(method_state)
