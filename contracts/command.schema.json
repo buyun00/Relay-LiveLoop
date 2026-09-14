@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://relay-liveloop.example/schemas/command.schema.json",
+  "title": "Relay LiveLoop command envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "requestId", "operation", "arguments"],
+  "properties": {
+    "protocolVersion": { "const": 1 },
+    "requestId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "status", "task.open", "task.update", "task.show", "observe",
+        "source.locate", "source.edit", "component.preview", "component.revert",
+        "prepare", "task.approve", "iterate", "verify", "report",
+        "baseline.build", "baseline.import", "player.start", "player.attach",
+        "player.stop", "job.status", "job.cancel"
+      ]
+    },
+    "taskId": { "type": ["string", "null"], "minLength": 1 },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "projectId": { "type": "string", "minLength": 1 },
+        "workspaceId": { "type": "string", "minLength": 1 },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "expectedRuntimeRevision": { "type": "string", "minLength": 1 }
+      }
+    },
+    "arguments": { "type": "object" }
+  }
+}
+

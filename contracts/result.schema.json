@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://relay-liveloop.example/schemas/result.schema.json",
+  "title": "Relay LiveLoop result envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["requestId", "status", "runtimeChanged", "facts", "error", "artifacts"],
+  "properties": {
+    "requestId": { "type": "string", "minLength": 1 },
+    "status": {
+      "enum": ["accepted", "completed", "approval_required", "failed", "state_unknown"]
+    },
+    "jobId": { "type": ["string", "null"] },
+    "planId": { "type": ["string", "null"] },
+    "runtimeChanged": { "type": ["boolean", "null"] },
+    "facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceSaved", "runtimeMatched", "checksPassed", "visualReviewed", "freshVerified"],
+      "properties": {
+        "sourceSaved": { "type": ["boolean", "null"] },
+        "runtimeMatched": { "type": ["boolean", "null"] },
+        "checksPassed": { "type": ["boolean", "null"] },
+        "visualReviewed": { "type": ["boolean", "null"] },
+        "freshVerified": { "type": ["boolean", "null"] }
+      }
+    },
+    "result": { "type": "object" },
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "stage", "message", "recoverable"],
+          "properties": {
+            "code": {
+              "enum": [
+                "CAPABILITY_UNAVAILABLE", "AUTH_REQUIRED", "CONTRACT_MISMATCH",
+                "WRONG_SESSION", "STALE_TARGET", "INPUT_CHANGED", "COMPILE_FAILED",
+                "RESOURCE_BUILD_FAILED", "APPROVAL_REQUIRED", "UNLOAD_REFUSED",
+                "RESTORE_FAILED", "STATE_UNKNOWN", "INVALID_REQUEST", "NOT_FOUND",
+                "CONFLICT", "INTERNAL_ERROR"
+              ]
+            },
+            "stage": { "type": "string", "minLength": 1 },
+            "message": { "type": "string", "minLength": 1 },
+            "recoverable": { "type": "boolean" },
+            "details": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifactId", "kind", "sha256"],
+        "properties": {
+          "artifactId": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+          "mediaType": { "type": "string" },
+          "size": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "timingsMs": {
+      "type": "object",
+      "additionalProperties": { "type": "number", "minimum": 0 }
+    }
+  }
+}
+

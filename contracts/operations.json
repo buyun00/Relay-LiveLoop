@@ -1,0 +1,32 @@
+{
+  "protocolVersion": 1,
+  "transports": {
+    "http": ["GET /status", "GET /capabilities", "POST /commands", "GET /jobs/{id}", "GET /artifacts/{id}"],
+    "cli": "relay-liveloop <operation> [arguments] --json",
+    "mcpPrefix": "relay_liveloop_"
+  },
+  "operations": [
+    { "name": "status", "requiredArguments": [], "effect": "read", "result": "systemSummary" },
+    { "name": "task.open", "requiredArguments": ["goal", "sessionId", "target", "allowedImpact", "acceptance"], "effect": "task", "result": "task" },
+    { "name": "task.update", "requiredArguments": ["taskId", "updates"], "effect": "task", "result": "task" },
+    { "name": "task.show", "requiredArguments": ["taskId"], "effect": "read", "result": "task" },
+    { "name": "observe", "requiredArguments": ["taskId"], "effect": "read", "result": "observation" },
+    { "name": "source.locate", "requiredArguments": ["taskId", "target"], "effect": "read", "result": "sourceAddress" },
+    { "name": "source.edit", "requiredArguments": ["taskId", "edits", "expectedSourceHash"], "effect": "source", "result": "sourceDiff" },
+    { "name": "component.preview", "requiredArguments": ["taskId", "target", "changes", "expected"], "effect": "runtime", "result": "overlay" },
+    { "name": "component.revert", "requiredArguments": ["taskId", "overlayId"], "effect": "runtime", "result": "revertReport" },
+    { "name": "prepare", "requiredArguments": ["taskId"], "effect": "build_only", "result": "planOrJob" },
+    { "name": "task.approve", "requiredArguments": ["taskId", "planId", "userConfirmationRef", "approvedImpact"], "effect": "approval", "result": "approvalRecord" },
+    { "name": "iterate", "requiredArguments": ["taskId"], "effect": "runtime", "result": "jobOrApprovalRequired" },
+    { "name": "verify", "requiredArguments": ["taskId", "checkSetId"], "effect": "approved_test", "result": "checksAndEvidence" },
+    { "name": "report", "requiredArguments": ["taskId"], "effect": "read", "result": "reportArtifact" },
+    { "name": "baseline.build", "requiredArguments": ["sourceSnapshot", "profileId", "authorizationRef"], "effect": "build", "result": "job" },
+    { "name": "baseline.import", "requiredArguments": ["artifactId"], "effect": "registration", "result": "baseline" },
+    { "name": "player.start", "requiredArguments": ["baselineId", "authorizationRef"], "effect": "process", "result": "session" },
+    { "name": "player.attach", "requiredArguments": ["sessionId"], "effect": "binding", "result": "session" },
+    { "name": "player.stop", "requiredArguments": ["sessionId", "authorizationRef"], "effect": "process", "result": "stoppedState" },
+    { "name": "job.status", "requiredArguments": ["jobId"], "effect": "read", "result": "job" },
+    { "name": "job.cancel", "requiredArguments": ["jobId"], "effect": "job", "result": "cancelRequestedOrSafeResult" }
+  ]
+}
+

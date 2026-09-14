@@ -1,0 +1,25 @@
+{
+  "protocolVersion": 1,
+  "requestId": "synthetic-request-001",
+  "operation": "task.open",
+  "taskId": null,
+  "context": {
+    "projectId": "synthetic-project",
+    "workspaceId": "synthetic-workspace",
+    "sessionId": "synthetic-session",
+    "expectedRuntimeRevision": "synthetic-revision-1"
+  },
+  "arguments": {
+    "goal": "Align the sample panel button with its synthetic reference",
+    "sessionId": "synthetic-session",
+    "target": "sample-panel/primary-button",
+    "allowedImpact": {
+      "hotfix": true,
+      "rebuildViews": ["sample-panel"],
+      "reloadModules": [],
+      "restartPlayer": false,
+      "buildBaseline": false
+    },
+    "acceptance": ["alignment check passes", "one synthetic click is observed"]
+  }
+}
