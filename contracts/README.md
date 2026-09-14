@@ -9,7 +9,6 @@ Protocol version 1 uses one command envelope and one result envelope across HTTP
 - Unknown facts stay `null`.
 - Artifact payloads are referenced by identifier; large binary data is not embedded in command responses.
 
-`operations.json` is the machine-readable operation catalog. `provider-contracts.md` describes the dependency direction between the command service and generic Unity providers.
+`operations.json` is the machine-readable operation catalog. `provider-contracts.md` describes the dependency direction between the command service and generic Unity providers. `editor-transport.md` defines the durable, idempotent Host-to-Editor request/result boundary.
 
 All examples in this directory are synthetic and do not identify an application or workspace.
-

@@ -6,6 +6,7 @@ __path__ = extend_path(__path__, __name__)
 
 from .artifacts import ArtifactStore
 from .coordinator import UpdateCoordinator
+from .editor_transport import EditorJobEnvelope, EditorJobTicket, EditorJobTransport
 from .evidence import EvidenceStore
 from .ledger import Ledger
 from .providers import ProviderRegistry
@@ -15,6 +16,9 @@ from .service import CommandService
 __all__ = [
     "ArtifactStore",
     "CommandService",
+    "EditorJobEnvelope",
+    "EditorJobTicket",
+    "EditorJobTransport",
     "EvidenceStore",
     "Ledger",
     "ProviderRegistry",
