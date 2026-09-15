@@ -64,6 +64,31 @@ class ProductionRuntimeWiringTests(unittest.TestCase):
         })
         self.assertEqual(click["operation"], "input.click")
 
+    def test_production_service_uses_single_fail_closed_coordinator_binding(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from host.artifacts import ArtifactStore
+        from host.ledger import Ledger
+        from relay_liveloop import build_command_service
+
+        with TemporaryDirectory() as root:
+            root_path = Path(root)
+            artifact_root = root_path / "artifacts"
+            artifact_root.mkdir()
+            ledger = Ledger(root_path / "host.sqlite3")
+            service = build_command_service(
+                ledger,
+                ArtifactStore(ledger, [artifact_root]),
+            )
+            try:
+                self.assertIsNone(service.coordinator)
+                self.assertFalse(service.coordinator_binding.state.bound)
+                self.assertFalse(service.coordinator_binding.state.preparation_available)
+                self.assertFalse(service.coordinator_binding.state.runtime_available)
+            finally:
+                service.close()
+                ledger.close()
+
 
 if __name__ == "__main__":
     unittest.main()

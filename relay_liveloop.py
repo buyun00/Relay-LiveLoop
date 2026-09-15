@@ -16,6 +16,7 @@ from host.service import CommandService
 from host.runtime_session import load_runtime_session
 from host.runtime_transport import LoopbackRuntimeHostTransport
 from host.runtime_transport_provider import RuntimeTransportProvider
+from host.coordinator_binding import bind_shared_coordinator
 from host.validation import OPERATIONS
 
 TOKEN_ENV = "RELAY_LIVELOOP_TOKEN"
@@ -96,6 +97,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_command_service(
+    ledger: Ledger,
+    artifacts: ArtifactStore,
+    *,
+    providers=None,
+    preparation_provider=None,
+    runtime_provider=None,
+) -> CommandService:
+    """Construct the shared service and attach its single optional coordinator owner."""
+    service = CommandService(ledger, artifacts, providers=providers)
+    binding = bind_shared_coordinator(service, preparation_provider, runtime_provider)
+    service.coordinator_binding = binding
+    return service
+
+
 def _serve(args: argparse.Namespace) -> int:
     token = _token_from_args(args)
     roots = []
@@ -124,7 +140,7 @@ def _serve(args: argparse.Namespace) -> int:
         providers.register("observation", "development-player-observation", player, verified=True)
         verification = RuntimeTransportProvider(runtime_transport, {"verify", "input.click", "input.text"})
         providers.register("verification", "development-player-verification", verification, verified=True)
-    service = CommandService(ledger, ArtifactStore(ledger, roots), providers=providers)
+    service = build_command_service(ledger, ArtifactStore(ledger, roots), providers=providers)
     server = create_http_server(service, token, args.host, args.port)
     try:
         server.serve_forever(poll_interval=0.25)
