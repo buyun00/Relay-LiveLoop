@@ -48,6 +48,22 @@ class ProductionRuntimeWiringTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not supported"):
             provider.execute("verify", {"requestId": "request-1"})
 
+    def test_input_mutation_operations_are_protocol_bound_to_verification(self):
+        from host.service import PROVIDER_OPERATIONS
+        from host.validation import validate_command
+
+        self.assertEqual(PROVIDER_OPERATIONS["input.click"], "verification")
+        self.assertEqual(PROVIDER_OPERATIONS["input.text"], "verification")
+        click = validate_command({
+            "protocolVersion": 1, "requestId": "request-click", "taskId": "task-1",
+            "operation": "input.click", "arguments": {
+                "targetId": "weekly-card-page", "expectedOwnerGeneration": 0,
+                "expectedFrame": 1, "expectedViewportGeneration": 0,
+                "screenX": 10.0, "screenY": 20.0,
+            },
+        })
+        self.assertEqual(click["operation"], "input.click")
+
 
 if __name__ == "__main__":
     unittest.main()

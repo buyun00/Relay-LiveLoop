@@ -188,6 +188,48 @@ namespace RelayLiveLoop
             }
         }
 
+        public Task<RelayLiveLoopResult> ScheduleAuthenticatedAsync(
+            AuthenticatedRuntimeRequest request,
+            Func<AuthenticatedRuntimeRequest, CancellationToken, Task<RelayLiveLoopResult>> mainThreadHandler,
+            CancellationToken cancellationToken)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(RuntimeBridgeCore));
+            if (request == null || request.Authentication == null || request.Payload == null)
+                return FailureTask(RelayLiveLoopErrorCode.InvalidMessage, "validate_request", "Request fields are incomplete.", false);
+            if (mainThreadHandler == null) throw new ArgumentNullException(nameof(mainThreadHandler));
+            if (request.Payload.Length <= 0 || request.Payload.Length > _limits.MaximumMessageBytes)
+                return FailureTask(request.Payload.Length > _limits.MaximumMessageBytes ? RelayLiveLoopErrorCode.MessageTooLarge : RelayLiveLoopErrorCode.InvalidMessage,
+                    "validate_request", "Payload length is outside the configured bounds.", false);
+            if (!string.Equals(request.ExpectedSessionId, _identity.SessionId, StringComparison.Ordinal))
+                return FailureTask(RelayLiveLoopErrorCode.WrongSession, "validate_request", "Request targets another Player session.", false);
+            var revision = RuntimeRevisions.CaptureIfCurrent(request.ExpectedRuntimeRevision, "validate_request");
+            if (!revision.Succeeded) return FailureTask(revision.Error);
+            var payloadHash = SessionAuthentication.ComputeSha256(request.Payload);
+            if (!string.Equals(payloadHash, request.Authentication.PayloadSha256, StringComparison.OrdinalIgnoreCase))
+                return FailureTask(RelayLiveLoopErrorCode.ContractMismatch, "validate_request", "Authenticated payload hash does not match the body.", false);
+            var authResult = Authentication.AuthenticateRequest(request.Authentication);
+            if (!authResult.Succeeded) return Task.FromResult(authResult);
+            lock (_requestsSync)
+            {
+                TrackedRequest tracked;
+                if (_requests.TryGetValue(request.Authentication.RequestId, out tracked))
+                {
+                    if (!string.Equals(tracked.PayloadHash, payloadHash, StringComparison.OrdinalIgnoreCase))
+                        return FailureTask(RelayLiveLoopErrorCode.InputChanged, "idempotency", "Request id was reused with a different payload.", false);
+                    return tracked.Task;
+                }
+                TrimTrackedRequests();
+                if (_requests.Count >= _limits.MaximumTrackedRequests)
+                    return FailureTask(RelayLiveLoopErrorCode.Busy, "idempotency", "Tracked request capacity is full while earlier requests are still running.", true);
+                var task = _dispatcher.ScheduleAsync(request.Authentication.RequestId,
+                    () => ExecuteOnMainThreadAsync(request, mainThreadHandler, cancellationToken),
+                    _limits.MainThreadTimeout, cancellationToken);
+                _requests.Add(request.Authentication.RequestId, new TrackedRequest { PayloadHash = payloadHash, Task = task });
+                _requestOrder.Enqueue(request.Authentication.RequestId);
+                return task;
+            }
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
@@ -214,6 +256,17 @@ namespace RelayLiveLoop
                 "main_thread_execute");
             if (!revision.Succeeded) return RelayLiveLoopResult.Failure(revision.Error);
             return mainThreadHandler(request);
+        }
+
+        private async Task<RelayLiveLoopResult> ExecuteOnMainThreadAsync(
+            AuthenticatedRuntimeRequest request,
+            Func<AuthenticatedRuntimeRequest, CancellationToken, Task<RelayLiveLoopResult>> mainThreadHandler,
+            CancellationToken cancellationToken)
+        {
+            _dispatcher.AssertMainThread();
+            var revision = RuntimeRevisions.CaptureIfCurrent(request.ExpectedRuntimeRevision, "main_thread_execute");
+            if (!revision.Succeeded) return RelayLiveLoopResult.Failure(revision.Error);
+            return await mainThreadHandler(request, cancellationToken);
         }
 
         private void TrimTrackedRequests()

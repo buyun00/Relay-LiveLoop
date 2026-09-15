@@ -21,6 +21,8 @@ PROVIDER_OPERATIONS = {
     "component.preview": "runtime_component",
     "component.revert": "runtime_component",
     "verify": "verification",
+    "input.click": "verification",
+    "input.text": "verification",
     "baseline.build": "baseline",
     "baseline.import": "baseline",
     "player.start": "player_process",

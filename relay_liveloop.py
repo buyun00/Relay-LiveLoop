@@ -122,7 +122,7 @@ def _serve(args: argparse.Namespace) -> int:
         runtime_transport.start()
         player = RuntimeTransportProvider(runtime_transport, {"observe"})
         providers.register("observation", "development-player-observation", player, verified=True)
-        verification = RuntimeTransportProvider(runtime_transport, {"verify"})
+        verification = RuntimeTransportProvider(runtime_transport, {"verify", "input.click", "input.text"})
         providers.register("verification", "development-player-verification", verification, verified=True)
     service = CommandService(ledger, ArtifactStore(ledger, roots), providers=providers)
     server = create_http_server(service, token, args.host, args.port)

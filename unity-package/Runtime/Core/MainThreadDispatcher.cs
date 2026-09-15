@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Collections;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
@@ -20,6 +21,7 @@ namespace RelayLiveLoop
         {
             public string RequestId;
             public Func<RelayLiveLoopResult> Work;
+            public Func<Task<RelayLiveLoopResult>> AsyncWork;
             public DateTimeOffset DeadlineUtc;
             public CancellationToken CancellationToken;
             public TaskCompletionSource<RelayLiveLoopResult> Completion;
@@ -116,12 +118,59 @@ namespace RelayLiveLoop
             return completion.Task;
         }
 
+        public Task<RelayLiveLoopResult> ScheduleAsync(
+            string requestId,
+            Func<Task<RelayLiveLoopResult>> work,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            if (!_initialized) throw new InvalidOperationException("Dispatcher is not initialized.");
+            if (string.IsNullOrWhiteSpace(requestId)) throw new ArgumentException("Request id is required.", nameof(requestId));
+            if (work == null) throw new ArgumentNullException(nameof(work));
+            if (timeout <= TimeSpan.Zero || timeout > TimeSpan.FromMinutes(5)) throw new ArgumentOutOfRangeException(nameof(timeout));
+            if (_stopping)
+                return Task.FromResult(RelayLiveLoopResult.Failure(RelayLiveLoopErrors.Create(
+                    RelayLiveLoopErrorCode.StateUnknown, "main_thread_queue", "Dispatcher is stopping.", true, null)));
+            var pending = Interlocked.Increment(ref _pendingCount);
+            if (pending > _maximumPending)
+            {
+                Interlocked.Decrement(ref _pendingCount);
+                return Task.FromResult(RelayLiveLoopResult.Failure(RelayLiveLoopErrors.Create(
+                    RelayLiveLoopErrorCode.Busy, "main_thread_queue", "Main-thread queue capacity is full.", true)));
+            }
+            var completion = new TaskCompletionSource<RelayLiveLoopResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _queue.Enqueue(new WorkItem
+            {
+                RequestId = requestId,
+                AsyncWork = work,
+                DeadlineUtc = DateTimeOffset.UtcNow.Add(timeout),
+                CancellationToken = cancellationToken,
+                Completion = completion
+            });
+            return completion.Task;
+        }
+
         public void AssertMainThread()
         {
             if (!IsMainThread)
             {
                 throw new InvalidOperationException("Unity object access must execute through the Relay LiveLoop main-thread dispatcher.");
             }
+        }
+
+        public Task WaitOneFrameAsync(CancellationToken cancellationToken)
+        {
+            AssertMainThread();
+            var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            StartCoroutine(CompleteNextFrame(completion, cancellationToken));
+            return completion.Task;
+        }
+
+        private IEnumerator CompleteNextFrame(TaskCompletionSource<bool> completion, CancellationToken cancellationToken)
+        {
+            yield return null;
+            if (cancellationToken.IsCancellationRequested) completion.TrySetCanceled();
+            else completion.TrySetResult(true);
         }
 
         internal void DrainOnce()
@@ -155,14 +204,21 @@ namespace RelayLiveLoop
 
                 try
                 {
-                    var result = item.Work();
-                    item.Completion.TrySetResult(result ?? RelayLiveLoopResult.Failure(
-                        RelayLiveLoopErrors.Create(
-                            RelayLiveLoopErrorCode.InternalError,
-                            "main_thread_execute",
-                            "Main-thread handler returned no result.",
-                            false,
-                            null)));
+                    if (item.AsyncWork != null)
+                    {
+                        _ = CompleteAsync(item);
+                    }
+                    else
+                    {
+                        var result = item.Work();
+                        item.Completion.TrySetResult(result ?? RelayLiveLoopResult.Failure(
+                            RelayLiveLoopErrors.Create(
+                                RelayLiveLoopErrorCode.InternalError,
+                                "main_thread_execute",
+                                "Main-thread handler returned no result.",
+                                false,
+                                null)));
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -174,6 +230,41 @@ namespace RelayLiveLoop
                             false,
                             null)));
                 }
+            }
+        }
+
+        private async Task CompleteAsync(WorkItem item)
+        {
+            try
+            {
+                var operation = item.AsyncWork();
+                var remaining = item.DeadlineUtc - DateTimeOffset.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    item.Completion.TrySetResult(RelayLiveLoopResult.Failure(RelayLiveLoopErrors.Create(
+                        RelayLiveLoopErrorCode.Timeout, "main_thread_queue", "Asynchronous request expired during execution.", true)));
+                    return;
+                }
+                var timeout = Task.Delay(remaining, item.CancellationToken);
+                var completed = await Task.WhenAny(operation, timeout).ConfigureAwait(false);
+                if (!ReferenceEquals(completed, operation))
+                {
+                    item.Completion.TrySetResult(RelayLiveLoopResult.Failure(RelayLiveLoopErrors.Create(
+                        RelayLiveLoopErrorCode.Timeout, "main_thread_queue", "Asynchronous request exceeded its deadline.", true)));
+                    return;
+                }
+                item.Completion.TrySetResult(await operation.ConfigureAwait(false) ?? RelayLiveLoopResult.Failure(
+                    RelayLiveLoopErrors.Create(RelayLiveLoopErrorCode.InternalError, "main_thread_execute", "Main-thread handler returned no result.", false, null)));
+            }
+            catch (OperationCanceledException)
+            {
+                item.Completion.TrySetResult(RelayLiveLoopResult.Failure(RelayLiveLoopErrors.Create(
+                    RelayLiveLoopErrorCode.Timeout, "main_thread_queue", "Asynchronous request was cancelled.", true)));
+            }
+            catch (Exception ex)
+            {
+                item.Completion.TrySetResult(RelayLiveLoopResult.Failure(RelayLiveLoopErrors.Create(
+                    RelayLiveLoopErrorCode.InternalError, "main_thread_execute", ex.GetType().Name + ": " + ex.Message, false, null)));
             }
         }
 

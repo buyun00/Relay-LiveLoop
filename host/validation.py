@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from copy import deepcopy
 from typing import Any, Callable
@@ -28,6 +29,8 @@ OPERATIONS = frozenset(
         "task.approve",
         "iterate",
         "verify",
+        "input.click",
+        "input.text",
         "report",
         "baseline.build",
         "baseline.import",
@@ -287,6 +290,31 @@ def _verify(args: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _input_mutation(args: dict[str, Any], operation: str) -> dict[str, Any]:
+    required = {"targetId", "expectedOwnerGeneration", "expectedFrame", "expectedViewportGeneration"}
+    optional = {"taskId"}
+    if operation == "input.click":
+        required |= {"screenX", "screenY"}
+    else:
+        required.add("text")
+    _expect_exact_keys(args, "arguments", required, optional)
+    result = {"targetId": _identifier(args["targetId"], "arguments.targetId")}
+    for key in ("expectedOwnerGeneration", "expectedFrame", "expectedViewportGeneration"):
+        if type(args[key]) is not int:
+            _fail(f"arguments.{key} must be an integer.")
+        result[key] = args[key]
+    if operation == "input.click":
+        for key in ("screenX", "screenY"):
+            if type(args[key]) not in (int, float) or not math.isfinite(args[key]):
+                _fail(f"arguments.{key} must be a finite number.")
+            result[key] = args[key]
+    else:
+        result["text"] = _string(args["text"], "arguments.text", maximum=4096)
+    if "taskId" in args:
+        result["taskId"] = _identifier(args["taskId"], "arguments.taskId")
+    return result
+
+
 def _baseline_build(args: dict[str, Any]) -> dict[str, Any]:
     _expect_exact_keys(args, "arguments", {"sourceSnapshot", "profileId", "authorizationRef"})
     return {key: _identifier(args[key], f"arguments.{key}") for key in ("sourceSnapshot", "profileId", "authorizationRef")}
@@ -316,6 +344,8 @@ ARGUMENT_VALIDATORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "task.approve": _approve,
     "iterate": _iterate,
     "verify": _verify,
+    "input.click": lambda args: _input_mutation(args, "input.click"),
+    "input.text": lambda args: _input_mutation(args, "input.text"),
     "report": _task_reference,
     "baseline.build": _baseline_build,
     "baseline.import": lambda args: _single_id(args, "artifactId"),
@@ -359,7 +389,7 @@ def validate_command(raw: Any) -> dict[str, Any]:
     if task_id and argument_task_id and task_id != argument_task_id:
         _fail("taskId and arguments.taskId must match when both are supplied.")
     task_id = task_id or argument_task_id
-    if operation in {"task.update", "task.show", "observe", "source.locate", "source.edit", "component.preview", "component.revert", "prepare", "task.approve", "iterate", "verify", "report"} and not task_id:
+    if operation in {"task.update", "task.show", "observe", "source.locate", "source.edit", "component.preview", "component.revert", "prepare", "task.approve", "iterate", "verify", "input.click", "input.text", "report"} and not task_id:
         _fail(f"{operation} requires taskId.")
     normalized = {
         "protocolVersion": PROTOCOL_VERSION,

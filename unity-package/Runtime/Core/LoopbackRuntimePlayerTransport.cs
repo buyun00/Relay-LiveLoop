@@ -102,9 +102,20 @@ namespace RelayLiveLoop
             RuntimeBridgeCore bridge,
             IRuntimeTransportCommandHandler handler,
             RuntimePlayerTransportOptions options = null)
+            : this(bridge, handler, null, options)
+        {
+        }
+
+        public LoopbackRuntimePlayerTransport(
+            RuntimeBridgeCore bridge,
+            IRuntimeTransportCommandHandler handler,
+            IRuntimeTransportAsyncCommandHandler asyncHandler,
+            RuntimePlayerTransportOptions options = null)
         {
             _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
-            _commands = new RuntimeTransportCommandAdapter(bridge, handler);
+            _commands = asyncHandler == null
+                ? new RuntimeTransportCommandAdapter(bridge, handler)
+                : new RuntimeTransportCommandAdapter(bridge, handler, asyncHandler);
             _options = options ?? new RuntimePlayerTransportOptions();
         }
 
@@ -437,7 +448,7 @@ namespace RelayLiveLoop
                 message.ExpectedRuntimeRevision,
                 authentication,
                 payload);
-            var task = _commands.Schedule(request, transportCancellation);
+            var task = _commands.ScheduleAsync(request, transportCancellation);
             var timeout = Task.Delay(_options.RequestWaitTimeout, transportCancellation);
             var completed = await Task.WhenAny(task, timeout).ConfigureAwait(false);
             if (!ReferenceEquals(completed, task))
@@ -829,5 +840,4 @@ namespace RelayLiveLoop
     }
 }
 #endif
-
 

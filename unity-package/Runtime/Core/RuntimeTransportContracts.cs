@@ -43,6 +43,18 @@ namespace RelayLiveLoop
     }
 
     /// <summary>
+    /// Optional asynchronous companion for handlers whose main-thread operation must yield,
+    /// such as a one-frame UI focus boundary. It shares the existing bridge and idempotency
+    /// path; it is not a second transport or command router.
+    /// </summary>
+    public interface IRuntimeTransportAsyncCommandHandler
+    {
+        System.Threading.Tasks.Task<RelayLiveLoopResult<NeutralPayload>> ExecuteAsync(
+            RuntimeTransportCommandContext request,
+            System.Threading.CancellationToken cancellationToken);
+    }
+
+    /// <summary>
     /// The concrete result stored by RuntimeBridgeCore's existing request-id tracker. Keeping
     /// the payload on the result object means an exact duplicate shares the original result
     /// Task and bytes without introducing another idempotency cache or ledger.
@@ -103,6 +115,7 @@ namespace RelayLiveLoop
     {
         private readonly RuntimeBridgeCore _bridge;
         private readonly IRuntimeTransportCommandHandler _handler;
+        private readonly IRuntimeTransportAsyncCommandHandler _asyncHandler;
 
         public RuntimeTransportCommandAdapter(
             RuntimeBridgeCore bridge,
@@ -112,11 +125,28 @@ namespace RelayLiveLoop
             _handler = handler ?? throw new ArgumentNullException(nameof(handler));
         }
 
+        public RuntimeTransportCommandAdapter(
+            RuntimeBridgeCore bridge,
+            IRuntimeTransportCommandHandler handler,
+            IRuntimeTransportAsyncCommandHandler asyncHandler)
+            : this(bridge, handler)
+        {
+            _asyncHandler = asyncHandler ?? throw new ArgumentNullException(nameof(asyncHandler));
+        }
+
         public System.Threading.Tasks.Task<RelayLiveLoopResult> Schedule(
             AuthenticatedRuntimeRequest request,
             System.Threading.CancellationToken cancellationToken)
         {
             return _bridge.ScheduleAuthenticated(request, ExecuteOnMainThread, cancellationToken);
+        }
+
+        public System.Threading.Tasks.Task<RelayLiveLoopResult> ScheduleAsync(
+            AuthenticatedRuntimeRequest request,
+            System.Threading.CancellationToken cancellationToken)
+        {
+            if (_asyncHandler == null) return Schedule(request, cancellationToken);
+            return _bridge.ScheduleAuthenticatedAsync(request, ExecuteOnMainThreadAsync, cancellationToken);
         }
 
         private RelayLiveLoopResult ExecuteOnMainThread(AuthenticatedRuntimeRequest request)
@@ -236,8 +266,71 @@ namespace RelayLiveLoop
 
             return RuntimeTransportExecutionResult.Failed(result.Error, revisionAfter);
         }
+
+        private async System.Threading.Tasks.Task<RelayLiveLoopResult> ExecuteOnMainThreadAsync(
+            AuthenticatedRuntimeRequest request,
+            System.Threading.CancellationToken cancellationToken)
+        {
+            var revisionBefore = _bridge.Identity.RuntimeRevision;
+            RelayLiveLoopResult<NeutralPayload> result;
+            try
+            {
+                result = await _asyncHandler.ExecuteAsync(new RuntimeTransportCommandContext(
+                    request.Authentication.RequestId,
+                    request.Authentication.Operation,
+                    request.ExpectedSessionId,
+                    request.ExpectedRuntimeRevision,
+                    request.Payload), cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                var changed = !string.Equals(revisionBefore, _bridge.Identity.RuntimeRevision, StringComparison.Ordinal);
+                return RuntimeTransportExecutionResult.Failed(
+                    RelayLiveLoopErrors.Create(
+                        changed ? RelayLiveLoopErrorCode.StateUnknown : RelayLiveLoopErrorCode.InternalError,
+                        "runtime_transport_execute",
+                        changed ? "The operation handler threw after the runtime revision changed." :
+                            "The operation handler threw before reporting a contract result: " + exception.Message,
+                        false, changed ? (bool?)true : null,
+                        new Dictionary<string, string> { { "exceptionType", exception.GetType().Name } }),
+                    _bridge.Identity.RuntimeRevision);
+            }
+
+            var revisionAfter = _bridge.Identity.RuntimeRevision;
+            var runtimeChanged = !string.Equals(revisionBefore, revisionAfter, StringComparison.Ordinal);
+            if (result == null)
+            {
+                return RuntimeTransportExecutionResult.Failed(
+                    RelayLiveLoopErrors.Create(RelayLiveLoopErrorCode.ContractMismatch,
+                        "runtime_transport_execute", "The operation handler returned no result.", false,
+                        runtimeChanged ? (bool?)true : false), revisionAfter);
+            }
+            if (result.Succeeded && result.Value != null)
+            {
+                return RuntimeTransportExecutionResult.Completed(result.Value, runtimeChanged, revisionAfter);
+            }
+            if (!result.Succeeded && result.Error != null)
+            {
+                if (runtimeChanged && result.Error.RuntimeChanged != true)
+                {
+                    return RuntimeTransportExecutionResult.Failed(
+                        RelayLiveLoopErrors.Create(RelayLiveLoopErrorCode.StateUnknown,
+                            "runtime_transport_execute", "The handler failed after the runtime revision changed but did not report that mutation.", false, true), revisionAfter);
+                }
+                if (!runtimeChanged && result.Error.RuntimeChanged == true)
+                {
+                    return RuntimeTransportExecutionResult.Failed(
+                        RelayLiveLoopErrors.Create(RelayLiveLoopErrorCode.ContractMismatch,
+                            "runtime_transport_execute", "The handler reported a runtime mutation without publishing a new runtime revision.", false, false), revisionAfter);
+                }
+                return RuntimeTransportExecutionResult.Failed(result.Error, revisionAfter);
+            }
+            return RuntimeTransportExecutionResult.Failed(
+                RelayLiveLoopErrors.Create(RelayLiveLoopErrorCode.ContractMismatch,
+                    "runtime_transport_execute", "The asynchronous handler returned an invalid result.", false,
+                    runtimeChanged ? (bool?)true : false), revisionAfter);
+        }
     }
 }
 #endif
-
 
