@@ -13,6 +13,9 @@ from clients.http_client import RelayHTTPClient, RelayHTTPError
 from host.artifacts import ArtifactStore
 from host.ledger import Ledger
 from host.service import CommandService
+from host.runtime_session import load_runtime_session
+from host.runtime_transport import LoopbackRuntimeHostTransport
+from host.runtime_transport_provider import RuntimeTransportProvider
 from host.validation import OPERATIONS
 
 TOKEN_ENV = "RELAY_LIVELOOP_TOKEN"
@@ -67,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--artifact-root", action="append", required=True)
     serve.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost", "::1"))
     serve.add_argument("--port", type=int, default=18760)
+    serve.add_argument("--runtime-session-file", help="Protected JSON handoff for one authenticated Development Player session.")
     _common_security(serve)
 
     command = subparsers.add_parser("command", help="Send one protocol command to the local host.")
@@ -100,7 +104,27 @@ def _serve(args: argparse.Namespace) -> int:
         root.mkdir(parents=True, exist_ok=True)
         roots.append(root)
     ledger = Ledger(args.database)
-    service = CommandService(ledger, ArtifactStore(ledger, roots))
+    runtime_transport = None
+    providers = None
+    if args.runtime_session_file:
+        session = load_runtime_session(args.runtime_session_file)
+        runtime_transport = LoopbackRuntimeHostTransport(
+            shared_secret=session.shared_secret,
+            expected_session_id=session.session_id,
+            expected_launch_id=session.launch_id,
+            expected_runtime_revision=session.runtime_revision,
+            protocol_version=session.protocol_version,
+            listen_address=session.host_address,
+            port=session.port,
+        )
+        from host.providers import ProviderRegistry
+        providers = ProviderRegistry()
+        runtime_transport.start()
+        player = RuntimeTransportProvider(runtime_transport, {"observe"})
+        providers.register("observation", "development-player-observation", player, verified=True)
+        verification = RuntimeTransportProvider(runtime_transport, {"verify"})
+        providers.register("verification", "development-player-verification", verification, verified=True)
+    service = CommandService(ledger, ArtifactStore(ledger, roots), providers=providers)
     server = create_http_server(service, token, args.host, args.port)
     try:
         server.serve_forever(poll_interval=0.25)
@@ -108,6 +132,8 @@ def _serve(args: argparse.Namespace) -> int:
         pass
     finally:
         service.close()
+        if runtime_transport is not None:
+            runtime_transport.close()
         server.server_close()
         ledger.close()
     return 0

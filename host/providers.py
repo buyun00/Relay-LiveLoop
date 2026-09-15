@@ -58,7 +58,8 @@ class ProviderRegistry:
         if registration is None:
             raise capability_unavailable(capability, self._known.get(capability))
         provider_id, provider, verified = registration
-        if require_verified and not verified:
+        effective_verified = bool(getattr(provider, "is_verified", verified))
+        if require_verified and not effective_verified:
             raise capability_unavailable(capability, f"Provider {provider_id} is registered but has no verified capability evidence.")
         return provider
 
@@ -69,13 +70,14 @@ class ProviderRegistry:
             if registration is None:
                 state = CapabilityState(capability, False, None, reason, False)
             else:
-                provider_id, _provider, verified = registration
+                provider_id, provider, verified = registration
+                effective_verified = bool(getattr(provider, "is_verified", verified))
                 state = CapabilityState(
                     capability,
-                    verified,
+                    effective_verified,
                     provider_id,
-                    None if verified else "Provider is registered but has no verified capability evidence.",
-                    verified,
+                    None if effective_verified else "Provider is registered but has no authenticated capability evidence.",
+                    effective_verified,
                 )
             states.append(state.as_dict())
         return states

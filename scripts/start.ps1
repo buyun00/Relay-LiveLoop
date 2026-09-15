@@ -133,6 +133,13 @@ try {
             '--token-file', (Get-RelayFullPath -Path ([string]$config.tokenFile)
             )
         )
+        if ($null -ne $config.PSObject.Properties['runtimeSessionFile'] -and -not [string]::IsNullOrWhiteSpace([string]$config.runtimeSessionFile)) {
+            $runtimeSessionFile = Get-RelayFullPath -Path ([string]$config.runtimeSessionFile)
+            if (-not (Test-Path -LiteralPath $runtimeSessionFile -PathType Leaf)) {
+                throw 'Configured runtimeSessionFile does not refer to an existing protected handoff file.'
+            }
+            $hostArguments += @('--runtime-session-file', $runtimeSessionFile)
+        }
 
         if (-not $PSCmdlet.ShouldProcess('configured Relay LiveLoop Host', 'Start owned non-GUI Host process')) {
             $hostResult = [ordered]@{ state = 'planned'; processId = $null; ownedByDeployment = $false; protocolVerified = $false }
