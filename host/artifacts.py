@@ -65,6 +65,7 @@ class ArtifactStore:
         *,
         kind: str,
         expected_sha256: str | None = None,
+        expected_size: int | None = None,
         media_type: str | None = None,
         task_id: str | None = None,
         job_id: str | None = None,
@@ -79,6 +80,11 @@ class ArtifactStore:
                 raise CommandError("CONTRACT_MISMATCH", "expected_sha256 must be a lowercase SHA-256 value.", stage="artifact")
             if digest != expected_sha256:
                 raise CommandError("INPUT_CHANGED", "Artifact hash differs from the expected immutable input.", stage="artifact")
+        if expected_size is not None:
+            if type(expected_size) is not int or expected_size < 0:
+                raise CommandError("CONTRACT_MISMATCH", "expected_size must be a non-negative integer.", stage="artifact")
+            if size != expected_size:
+                raise CommandError("INPUT_CHANGED", "Artifact size differs from the expected immutable input.", stage="artifact", recoverable=False)
         effective_media_type = media_type or mimetypes.guess_type(scoped.name)[0] or "application/octet-stream"
         if not isinstance(effective_media_type, str) or not MEDIA_TYPE_RE.fullmatch(effective_media_type):
             raise CommandError("CONTRACT_MISMATCH", "Artifact media_type must be a bounded type/subtype token.", stage="artifact")

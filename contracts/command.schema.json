@@ -4,6 +4,48 @@
   "title": "Relay LiveLoop command envelope",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "verifyArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkSetId"],
+      "properties": {
+        "taskId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "checkSetId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "checks": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "type": "object" } },
+        "requirePocoSnapshot": { "type": "boolean" },
+        "captureId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "nonce": { "type": "string", "minLength": 16, "maxLength": 256 },
+        "requireFreshFrame": { "type": "boolean" },
+        "expectedViewportGeneration": { "type": "integer", "minimum": 0 },
+        "expectedOwnerGeneration": { "type": "integer", "minimum": 0 },
+        "targetId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "frameArtifactId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "minimumFrameExclusive": { "type": "integer", "minimum": 0 },
+        "maximumWidth": { "type": "integer", "minimum": 1, "maximum": 8192 },
+        "maximumHeight": { "type": "integer", "minimum": 1, "maximum": 8192 },
+        "requireViewport": { "type": "boolean" },
+        "minimumWidth": { "type": "integer", "minimum": 1, "maximum": 8192 },
+        "minimumHeight": { "type": "integer", "minimum": 1, "maximum": 8192 },
+        "requireSafeArea": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "requireFreshFrame": { "const": true } } },
+          "then": {
+            "required": [
+              "expectedViewportGeneration", "expectedOwnerGeneration", "targetId",
+              "frameArtifactId", "minimumFrameExclusive", "maximumWidth", "maximumHeight"
+            ]
+          }
+        },
+        {
+          "if": { "properties": { "requirePocoSnapshot": { "const": true } } },
+          "then": { "required": ["captureId", "nonce"] }
+        }
+      ]
+    }
+  },
   "required": ["protocolVersion", "requestId", "operation", "arguments"],
   "properties": {
     "protocolVersion": { "const": 1 },
@@ -31,5 +73,16 @@
       }
     },
     "arguments": { "type": "object" }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["operation"],
+        "properties": { "operation": { "const": "verify" } }
+      },
+      "then": {
+        "properties": { "arguments": { "$ref": "#/$defs/verifyArguments" } }
+      }
+    }
+  ]
 }

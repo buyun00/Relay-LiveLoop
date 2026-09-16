@@ -280,6 +280,7 @@ class CommandService:
             )
         capability = PROVIDER_OPERATIONS[operation]
         provider_result = self.providers.execute(capability, operation, command)
+        provider_result = self.result_policy.bind_fresh_frame(operation, command, provider_result)
         provider_result = self.result_policy.validate(operation, task_id, provider_result, request_id)
         return self._response(
             request_id,

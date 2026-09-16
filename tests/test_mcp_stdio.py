@@ -88,6 +88,24 @@ class MCPStdioTests(unittest.TestCase):
         tools = self.catalog.tools
         self.assertEqual(EXPECTED_TOOL_NAMES, [item["name"] for item in tools])
         self.assertTrue(all("requestId" in item["inputSchema"]["required"] for item in tools))
+        verify = next(item for item in tools if item["name"] == "relay_liveloop_verify")
+        verify_properties = verify["inputSchema"]["properties"]
+        self.assertEqual({"requestId", "taskId", "checkSetId"}, set(verify["inputSchema"]["required"]))
+        for field in (
+            "requireFreshFrame",
+            "expectedViewportGeneration",
+            "expectedOwnerGeneration",
+            "targetId",
+            "frameArtifactId",
+            "minimumFrameExclusive",
+            "maximumWidth",
+            "maximumHeight",
+            "requireViewport",
+            "minimumWidth",
+            "minimumHeight",
+            "requireSafeArea",
+        ):
+            self.assertIn(field, verify_properties)
 
     def test_current_stateless_tools_list_and_call(self) -> None:
         server = MCPServer(RelayHTTPClient(self.url, self.token), self.catalog)

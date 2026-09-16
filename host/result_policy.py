@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from typing import Any
 
 from host.artifacts import ArtifactStore
 from host.errors import CommandError
 from host.evidence import EvidenceStore
 from host.ledger import Ledger
+from host.validation import ID_RE
 
 FACT_KEYS = {"sourceSaved", "runtimeMatched", "checksPassed", "visualReviewed", "freshVerified"}
 ERROR_CODES = {
@@ -39,6 +41,247 @@ class ProviderResultPolicy:
         self.ledger = ledger
         self.artifacts = artifacts
         self.evidence = EvidenceStore(ledger)
+
+    def bind_fresh_frame(
+        self,
+        operation: str,
+        command: dict[str, Any],
+        value: Any,
+    ) -> Any:
+        """Register and normalize a Player fresh-frame receipt before result validation.
+
+        The Player supplies a FreshFrameArtifact-shaped object and the receipt's
+        task/session/launch/runtime/target/owner fields.  The Host checks those
+        bindings against the command and task ledger, then registers the file
+        through ArtifactStore so the configured roots and immutable hash boundary
+        remain authoritative.  The Player's source artifact id is never treated
+        as a Host artifact id.
+        """
+        arguments = command.get("arguments", {}) if isinstance(command, dict) else {}
+        if operation != "verify" or not isinstance(arguments, dict) or arguments.get("requireFreshFrame") is not True:
+            return value
+        if not isinstance(value, dict):
+            self._mismatch("Fresh-frame provider result must be an object.")
+        if value.get("status") != "completed":
+            return value
+        result = value.get("result")
+        if not isinstance(result, dict):
+            self._mismatch("A completed fresh-frame result must contain an object result.")
+        task_id = command.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            self._mismatch("A fresh-frame result requires command taskId.")
+        context = command.get("context", {})
+        if not isinstance(context, dict):
+            self._mismatch("A fresh-frame command context must be an object.")
+        for key in ("sessionId", "expectedRuntimeRevision", "expectedLaunchId"):
+            if not isinstance(context.get(key), str) or not context[key]:
+                self._mismatch(f"Fresh-frame command context.{key} is required.")
+
+        task = self.ledger.get_task(task_id)
+        binding = self._fresh_binding(result)
+        if binding["taskId"] != task_id:
+            self._mismatch("Fresh-frame result taskId does not match the command task.")
+        if binding["sessionId"] != context["sessionId"] or binding["sessionId"] != task["sessionId"]:
+            raise CommandError("WRONG_SESSION", "Fresh-frame result session does not match the command task.", stage="provider_result")
+        for key in ("launchId", "runtimeRevision"):
+            context_key = "expectedLaunchId" if key == "launchId" else "expectedRuntimeRevision"
+            if binding[key] != context[context_key]:
+                self._mismatch(f"Fresh-frame result {key} does not match command context.{context_key}.")
+        if binding["ownerGeneration"] != arguments["expectedOwnerGeneration"]:
+            raise CommandError("STALE_TARGET", "Fresh-frame owner generation does not match the request.", stage="provider_result", recoverable=True)
+        if binding["targetId"] != arguments["targetId"]:
+            raise CommandError("STALE_TARGET", "Fresh-frame target does not match the request.", stage="provider_result", recoverable=True)
+
+        frame = self._fresh_frame(result.get("freshFrame"))
+        source_artifact_id = frame["artifactId"]
+        if source_artifact_id != arguments["frameArtifactId"]:
+            self._mismatch("Fresh-frame artifactId does not match arguments.frameArtifactId.")
+        if frame["runtimeRevision"] != binding["runtimeRevision"]:
+            self._mismatch("Fresh-frame runtimeRevision does not match its result binding.")
+        if frame["viewportGeneration"] != arguments["expectedViewportGeneration"]:
+            raise CommandError("STALE_TARGET", "Fresh-frame viewport generation does not match the request.", stage="provider_result", recoverable=True)
+        if frame["frame"] <= arguments["minimumFrameExclusive"]:
+            raise CommandError("STALE_TARGET", "Fresh-frame number is not newer than the requested baseline.", stage="provider_result", recoverable=True)
+        if frame["width"] > arguments["maximumWidth"] or frame["height"] > arguments["maximumHeight"]:
+            self._mismatch("Fresh-frame dimensions exceed the requested bounds.")
+        if not frame["fresh"]:
+            self._mismatch("Fresh-frame artifact must assert fresh=true after binding checks.")
+        facts = value.get("facts")
+        if isinstance(facts, dict) and facts.get("freshVerified") is True:
+            fresh_verification = result.get("freshVerification")
+            if (
+                not isinstance(fresh_verification, dict)
+                or fresh_verification.get("checkSetId") != arguments["checkSetId"]
+                or not isinstance(fresh_verification.get("evidenceArtifactIds"), list)
+                or source_artifact_id not in fresh_verification["evidenceArtifactIds"]
+            ):
+                self._mismatch("freshVerified=true must bind the requested checkSetId to the fresh-frame artifact.")
+
+        registered = self.artifacts.register(
+            frame["path"],
+            kind=frame["kind"],
+            expected_sha256=frame["sha256"],
+            expected_size=frame["size"],
+            media_type=frame["mediaType"],
+            task_id=task_id,
+        )
+        if registered["size"] != frame["size"]:
+            raise CommandError("INPUT_CHANGED", "Fresh-frame file size differs from the provider receipt.", stage="artifact", recoverable=False)
+
+        normalized = deepcopy(value)
+        normalized_result = deepcopy(result)
+        normalized_frame = dict(frame)
+        normalized_frame["artifactId"] = registered["artifactId"]
+        normalized_result["freshFrame"] = normalized_frame
+        normalized_result["evidence"] = self._normalize_fresh_evidence(
+            normalized_result.get("evidence"), source_artifact_id, registered["artifactId"], frame["sha256"]
+        )
+        self._replace_known_evidence_references(normalized_result, source_artifact_id, registered["artifactId"])
+        normalized["result"] = normalized_result
+        normalized["artifacts"] = self._normalize_registered_artifacts(
+            normalized.get("artifacts", []), source_artifact_id, registered
+        )
+        return normalized
+
+    def _fresh_binding(self, result: dict[str, Any]) -> dict[str, Any]:
+        required = {
+            "taskId",
+            "sessionId",
+            "launchId",
+            "runtimeRevision",
+            "ownerGeneration",
+            "targetId",
+        }
+        missing = required - result.keys()
+        if missing:
+            self._mismatch(f"Fresh-frame result is missing binding fields: {', '.join(sorted(missing))}.")
+        binding: dict[str, Any] = {}
+        for key in ("taskId", "sessionId", "launchId", "runtimeRevision", "targetId"):
+            value = result[key]
+            if not isinstance(value, str) or not value or len(value) > 128:
+                self._mismatch(f"fresh-frame result {key} must be a bounded non-empty string.")
+            if key != "runtimeRevision" and not ID_RE.fullmatch(value):
+                self._mismatch(f"fresh-frame result {key} contains unsupported characters.")
+            binding[key] = value
+        if type(result["ownerGeneration"]) is not int or not 0 <= result["ownerGeneration"] <= 2**63 - 1:
+            self._mismatch("fresh-frame result ownerGeneration must be a bounded non-negative integer.")
+        binding["ownerGeneration"] = result["ownerGeneration"]
+        return binding
+
+    def _fresh_frame(self, value: Any) -> dict[str, Any]:
+        fields = {
+            "artifactId",
+            "kind",
+            "mediaType",
+            "path",
+            "sha256",
+            "size",
+            "frame",
+            "width",
+            "height",
+            "fresh",
+            "runtimeRevision",
+            "viewportGeneration",
+            "publishedAtUnixMilliseconds",
+        }
+        frame = self._exact_object(value, fields, "freshFrame")
+        for key in ("artifactId", "kind"):
+            if not isinstance(frame[key], str) or not ID_RE.fullmatch(frame[key]):
+                self._mismatch(f"freshFrame.{key} contains unsupported characters.")
+        for key in ("mediaType", "path", "runtimeRevision"):
+            if not isinstance(frame[key], str) or not frame[key] or len(frame[key]) > 4096:
+                self._mismatch(f"freshFrame.{key} must be a bounded non-empty string.")
+        if not frame["mediaType"].lower().startswith("image/"):
+            self._mismatch("freshFrame.mediaType must be an image media type.")
+        if not isinstance(frame["sha256"], str) or not SHA256_RE.fullmatch(frame["sha256"]):
+            self._mismatch("freshFrame.sha256 must be a lowercase SHA-256 value.")
+        for key in ("size", "frame", "width", "height", "viewportGeneration", "publishedAtUnixMilliseconds"):
+            if type(frame[key]) is not int or frame[key] < 0:
+                self._mismatch(f"freshFrame.{key} must be a non-negative integer.")
+        if frame["size"] <= 0 or frame["width"] <= 0 or frame["height"] <= 0 or frame["viewportGeneration"] <= 0 or frame["publishedAtUnixMilliseconds"] <= 0:
+            self._mismatch("freshFrame size, dimensions, viewport generation, and publication time must be positive.")
+        if type(frame["fresh"]) is not bool:
+            self._mismatch("freshFrame.fresh must be a boolean.")
+        return frame
+
+    def _normalize_registered_artifacts(
+        self,
+        value: Any,
+        source_artifact_id: str,
+        registered: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            self._mismatch("Provider artifacts must be an array.")
+        normalized: list[dict[str, Any]] = []
+        replaced = False
+        required = {"artifactId", "kind", "sha256", "mediaType", "size"}
+        for item in value:
+            if isinstance(item, dict) and item.get("artifactId") == source_artifact_id:
+                if set(item) != required:
+                    self._mismatch("Provider fresh-frame artifact metadata does not match protocol v1.")
+                if any(item[key] != registered[key] for key in ("kind", "sha256", "mediaType", "size")):
+                    self._mismatch("Provider fresh-frame artifact metadata differs from the registered file.")
+                normalized.append(registered)
+                replaced = True
+            else:
+                normalized.append(item)
+        if not replaced:
+            normalized.append(registered)
+        return normalized
+
+    def _normalize_fresh_evidence(
+        self,
+        value: Any,
+        source_artifact_id: str,
+        registered_artifact_id: str,
+        expected_sha256: str,
+    ) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > 128:
+            self._mismatch("Provider evidence must be a bounded array.")
+        normalized: list[dict[str, Any]] = []
+        fields = {"kind", "stage", "artifactId", "sha256", "detail"}
+        for item in value:
+            if not isinstance(item, dict) or not item.keys() <= fields or "kind" not in item or "stage" not in item:
+                self._mismatch("Provider evidence fields do not match the neutral evidence contract.")
+            evidence = dict(item)
+            for key in ("kind", "stage"):
+                if not isinstance(evidence[key], str) or not evidence[key] or len(evidence[key]) > 128:
+                    self._mismatch(f"Provider evidence {key} must be a bounded non-empty string.")
+            if evidence.get("artifactId") is not None:
+                if not isinstance(evidence["artifactId"], str) or not ID_RE.fullmatch(evidence["artifactId"]):
+                    self._mismatch("Provider evidence artifactId contains unsupported characters.")
+                if evidence["artifactId"] == source_artifact_id:
+                    evidence["artifactId"] = registered_artifact_id
+                    if evidence.get("sha256") not in {None, expected_sha256}:
+                        self._mismatch("Provider evidence sha256 differs from the registered frame.")
+            if evidence.get("sha256") is not None and not SHA256_RE.fullmatch(evidence["sha256"]):
+                self._mismatch("Provider evidence sha256 must be a lowercase SHA-256 value.")
+            if evidence.get("detail") is not None and (not isinstance(evidence["detail"], str) or len(evidence["detail"]) > 4096):
+                self._mismatch("Provider evidence detail must be a bounded string or null.")
+            normalized.append(evidence)
+        return normalized
+
+    @staticmethod
+    def _replace_known_evidence_references(result: dict[str, Any], source_artifact_id: str, registered_artifact_id: str) -> None:
+        checks = result.get("checks")
+        if isinstance(checks, list):
+            for check in checks:
+                if isinstance(check, dict) and isinstance(check.get("evidenceArtifactIds"), list):
+                    check["evidenceArtifactIds"] = [
+                        registered_artifact_id if item == source_artifact_id else item
+                        for item in check["evidenceArtifactIds"]
+                    ]
+        review = result.get("visualReview")
+        if isinstance(review, dict) and review.get("artifactId") == source_artifact_id:
+            review["artifactId"] = registered_artifact_id
+        fresh = result.get("freshVerification")
+        if isinstance(fresh, dict) and isinstance(fresh.get("evidenceArtifactIds"), list):
+            fresh["evidenceArtifactIds"] = [
+                registered_artifact_id if item == source_artifact_id else item
+                for item in fresh["evidenceArtifactIds"]
+            ]
 
     def validate(
         self,

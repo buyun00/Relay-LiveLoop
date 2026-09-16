@@ -93,6 +93,12 @@ def _boolean(value: Any, name: str) -> bool:
     return value
 
 
+def _bounded_integer(value: Any, name: str, *, minimum: int, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        _fail(f"{name} must be an integer in the range {minimum}..{maximum}.")
+    return value
+
+
 def _string_list(
     value: Any,
     name: str,
@@ -278,7 +284,26 @@ def _iterate(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _verify(args: dict[str, Any]) -> dict[str, Any]:
-    _expect_exact_keys(args, "arguments", {"checkSetId"}, {"taskId", "checks"})
+    optional = {
+        "taskId",
+        "checks",
+        "requirePocoSnapshot",
+        "captureId",
+        "nonce",
+        "requireFreshFrame",
+        "expectedViewportGeneration",
+        "expectedOwnerGeneration",
+        "targetId",
+        "frameArtifactId",
+        "minimumFrameExclusive",
+        "maximumWidth",
+        "maximumHeight",
+        "requireViewport",
+        "minimumWidth",
+        "minimumHeight",
+        "requireSafeArea",
+    }
+    _expect_exact_keys(args, "arguments", {"checkSetId"}, optional)
     result: dict[str, Any] = {"checkSetId": _identifier(args["checkSetId"], "arguments.checkSetId")}
     if "taskId" in args:
         result["taskId"] = _identifier(args["taskId"], "arguments.taskId")
@@ -287,6 +312,94 @@ def _verify(args: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(checks, list) or not 1 <= len(checks) <= 64:
             _fail("arguments.checks must contain 1..64 check objects.")
         result["checks"] = [_json_value(_expect_dict(item, f"arguments.checks[{i}]"), f"arguments.checks[{i}]") for i, item in enumerate(checks)]
+
+    require_poco = _boolean(args["requirePocoSnapshot"], "arguments.requirePocoSnapshot") if "requirePocoSnapshot" in args else False
+    if require_poco:
+        if "captureId" not in args or "nonce" not in args:
+            _fail("arguments.requirePocoSnapshot requires captureId and nonce.")
+        result["requirePocoSnapshot"] = True
+        result["captureId"] = _identifier(args["captureId"], "arguments.captureId")
+        result["nonce"] = _string(args["nonce"], "arguments.nonce", minimum=16, maximum=256)
+    elif "captureId" in args or "nonce" in args:
+        _fail("arguments.captureId and arguments.nonce require requirePocoSnapshot=true.")
+    elif "requirePocoSnapshot" in args:
+        result["requirePocoSnapshot"] = False
+
+    require_fresh = _boolean(args["requireFreshFrame"], "arguments.requireFreshFrame") if "requireFreshFrame" in args else False
+    fresh_fields = {
+        "frameArtifactId",
+        "minimumFrameExclusive",
+        "maximumWidth",
+        "maximumHeight",
+    }
+    if require_fresh:
+        required_fresh = {
+            "expectedViewportGeneration",
+            "expectedOwnerGeneration",
+            "targetId",
+            *fresh_fields,
+        }
+        missing = required_fresh - args.keys()
+        if missing:
+            _fail(f"arguments.requireFreshFrame is missing: {', '.join(sorted(missing))}.")
+        result["requireFreshFrame"] = True
+        result["expectedViewportGeneration"] = _bounded_integer(
+            args["expectedViewportGeneration"],
+            "arguments.expectedViewportGeneration",
+            minimum=1,
+            maximum=2**63 - 1,
+        )
+        result["expectedOwnerGeneration"] = _bounded_integer(
+            args["expectedOwnerGeneration"],
+            "arguments.expectedOwnerGeneration",
+            minimum=0,
+            maximum=2**63 - 1,
+        )
+        result["targetId"] = _identifier(args["targetId"], "arguments.targetId")
+        result["frameArtifactId"] = _identifier(args["frameArtifactId"], "arguments.frameArtifactId")
+        result["minimumFrameExclusive"] = _bounded_integer(
+            args["minimumFrameExclusive"],
+            "arguments.minimumFrameExclusive",
+            minimum=0,
+            maximum=2**63 - 1,
+        )
+        result["maximumWidth"] = _bounded_integer(
+            args["maximumWidth"], "arguments.maximumWidth", minimum=1, maximum=8192
+        )
+        result["maximumHeight"] = _bounded_integer(
+            args["maximumHeight"], "arguments.maximumHeight", minimum=1, maximum=8192
+        )
+    else:
+        if fresh_fields & args.keys():
+            _fail("fresh-frame bounds require requireFreshFrame=true.")
+        if "requireFreshFrame" in args:
+            result["requireFreshFrame"] = False
+        for key in ("expectedViewportGeneration", "expectedOwnerGeneration"):
+            if key in args:
+                result[key] = _bounded_integer(
+                    args[key],
+                    f"arguments.{key}",
+                    minimum=0,
+                    maximum=2**63 - 1,
+                )
+        if "targetId" in args:
+            result["targetId"] = _identifier(args["targetId"], "arguments.targetId")
+
+    require_viewport = _boolean(args["requireViewport"], "arguments.requireViewport") if "requireViewport" in args else False
+    viewport_fields = {"minimumWidth", "minimumHeight", "requireSafeArea"}
+    if require_viewport:
+        result["requireViewport"] = True
+        result["minimumWidth"] = _bounded_integer(
+            args.get("minimumWidth", 1), "arguments.minimumWidth", minimum=1, maximum=8192
+        )
+        result["minimumHeight"] = _bounded_integer(
+            args.get("minimumHeight", 1), "arguments.minimumHeight", minimum=1, maximum=8192
+        )
+        result["requireSafeArea"] = _boolean(args.get("requireSafeArea", False), "arguments.requireSafeArea")
+    elif viewport_fields & args.keys():
+        _fail("viewport bounds require requireViewport=true.")
+    elif "requireViewport" in args:
+        result["requireViewport"] = False
     return result
 
 
