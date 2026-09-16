@@ -157,6 +157,7 @@ namespace RelayLiveLoop
         public string ArtifactId { get; set; }
         public string ExpectedSessionId { get; set; }
         public string ExpectedRuntimeRevision { get; set; }
+        public long ExpectedViewportGeneration { get; set; }
         public long MinimumFrameExclusive { get; set; }
         public int MaximumWidth { get; set; }
         public int MaximumHeight { get; set; }
@@ -176,6 +177,8 @@ namespace RelayLiveLoop
         public int Height { get; set; }
         public bool Fresh { get; set; }
         public string RuntimeRevision { get; set; }
+        public long ViewportGeneration { get; set; }
+        public long PublishedAtUnixMilliseconds { get; set; }
     }
 
     public interface IRuntimeObservationProvider

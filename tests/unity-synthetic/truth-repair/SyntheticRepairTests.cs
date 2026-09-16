@@ -176,12 +176,13 @@ internal static class RuntimeTruthRepairSyntheticTests
                 Equal("revision-after", property.Value.RuntimeRevision, "property observation reads the shared revision");
 
                 var capture = new FreshFrameCaptureService();
-                capture.InitializeOnMainThread(identity, dispatcher, artifactRoot, 4096);
+                capture.InitializeOnMainThread(identity, dispatcher, artifactRoot, () => 1L, 4096);
                 var staleCapture = capture.Capture(new FreshFrameCaptureRequest
                 {
                     ArtifactId = "stale-frame",
                     ExpectedSessionId = identity.SessionId,
                     ExpectedRuntimeRevision = "revision-before",
+                    ExpectedViewportGeneration = 1,
                     MinimumFrameExclusive = 200,
                     MaximumWidth = 64,
                     MaximumHeight = 64,
@@ -194,6 +195,7 @@ internal static class RuntimeTruthRepairSyntheticTests
                     ArtifactId = "current-frame",
                     ExpectedSessionId = identity.SessionId,
                     ExpectedRuntimeRevision = "revision-after",
+                    ExpectedViewportGeneration = 1,
                     MinimumFrameExclusive = 200,
                     MaximumWidth = 64,
                     MaximumHeight = 64,

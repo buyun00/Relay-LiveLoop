@@ -74,6 +74,31 @@ RESULT_ALLOWED_KEYS = RESULT_REQUIRED_KEYS | {
     "result",
     "timingsMs",
 }
+EXPECTED_MCP_TOOL_NAMES = [
+    "relay_liveloop_baseline_build",
+    "relay_liveloop_baseline_import",
+    "relay_liveloop_component_preview",
+    "relay_liveloop_component_revert",
+    "relay_liveloop_input_click",
+    "relay_liveloop_input_text",
+    "relay_liveloop_iterate",
+    "relay_liveloop_job_cancel",
+    "relay_liveloop_job_status",
+    "relay_liveloop_observe",
+    "relay_liveloop_player_attach",
+    "relay_liveloop_player_start",
+    "relay_liveloop_player_stop",
+    "relay_liveloop_prepare",
+    "relay_liveloop_report",
+    "relay_liveloop_source_edit",
+    "relay_liveloop_source_locate",
+    "relay_liveloop_status",
+    "relay_liveloop_task_approve",
+    "relay_liveloop_task_open",
+    "relay_liveloop_task_show",
+    "relay_liveloop_task_update",
+    "relay_liveloop_verify",
+]
 
 
 def inferred_subject_root() -> Path:
@@ -908,7 +933,7 @@ class HTTPCLIProtocolConformance(unittest.TestCase):
         self.assertEqual([601, 602, 603, 604], [response["id"] for response in responses])
         self.assertEqual("2025-11-25", responses[0]["result"]["protocolVersion"])
         self.assertEqual(-32002, responses[1]["error"]["code"])
-        self.assertEqual(21, len(responses[2]["result"]["tools"]))
+        self.assertEqual(EXPECTED_MCP_TOOL_NAMES, [item["name"] for item in responses[2]["result"]["tools"]])
 
         tool_result = responses[3]["result"]
         self.assertFalse(tool_result["isError"])

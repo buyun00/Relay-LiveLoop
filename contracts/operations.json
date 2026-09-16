@@ -19,6 +19,8 @@
     { "name": "task.approve", "requiredArguments": ["taskId", "planId", "userConfirmationRef", "approvedImpact"], "effect": "approval", "result": "approvalRecord" },
     { "name": "iterate", "requiredArguments": ["taskId"], "effect": "runtime", "result": "jobOrApprovalRequired" },
     { "name": "verify", "requiredArguments": ["taskId", "checkSetId"], "effect": "approved_test", "result": "checksAndEvidence" },
+    { "name": "input.click", "requiredArguments": ["taskId", "targetId", "expectedOwnerGeneration", "expectedFrame", "expectedViewportGeneration", "screenX", "screenY"], "effect": "runtime", "result": "inputResult" },
+    { "name": "input.text", "requiredArguments": ["taskId", "targetId", "expectedOwnerGeneration", "expectedFrame", "expectedViewportGeneration", "text"], "effect": "runtime", "result": "inputResult" },
     { "name": "report", "requiredArguments": ["taskId"], "effect": "read", "result": "reportArtifact" },
     { "name": "baseline.build", "requiredArguments": ["sourceSnapshot", "profileId", "authorizationRef"], "effect": "build", "result": "job" },
     { "name": "baseline.import", "requiredArguments": ["artifactId"], "effect": "registration", "result": "baseline" },

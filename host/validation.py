@@ -382,7 +382,12 @@ def validate_command(raw: Any) -> dict[str, Any]:
         task_id = _identifier(task_id, "taskId")
     context = command.get("context", {})
     context = _expect_dict(context, "context")
-    _expect_exact_keys(context, "context", set(), {"projectId", "workspaceId", "sessionId", "expectedRuntimeRevision"})
+    _expect_exact_keys(
+        context,
+        "context",
+        set(),
+        {"projectId", "workspaceId", "sessionId", "expectedRuntimeRevision", "expectedLaunchId"},
+    )
     context = {key: _identifier(value, f"context.{key}") for key, value in context.items()}
     arguments = ARGUMENT_VALIDATORS[operation](_expect_dict(command["arguments"], "arguments"))
     argument_task_id = arguments.pop("taskId", None)

@@ -44,6 +44,13 @@ ARGUMENT_SCHEMAS: dict[str, dict[str, Any]] = {
     "jobId": {"type": "string", "minLength": 1, "maxLength": 128},
     "inputSnapshot": {"type": "string", "minLength": 1, "maxLength": 128},
     "expectedRuntimeRevision": {"type": "string", "minLength": 1, "maxLength": 128},
+    "targetId": {"type": "string", "minLength": 1, "maxLength": 128},
+    "expectedOwnerGeneration": {"type": "integer"},
+    "expectedFrame": {"type": "integer"},
+    "expectedViewportGeneration": {"type": "integer"},
+    "screenX": {"type": "number"},
+    "screenY": {"type": "number"},
+    "text": {"type": "string", "maxLength": 4096},
     "checks": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "object"}},
 }
 
@@ -91,6 +98,7 @@ class ToolCatalog:
                     "workspaceId": {"type": "string", "minLength": 1},
                     "sessionId": {"type": "string", "minLength": 1},
                     "expectedRuntimeRevision": {"type": "string", "minLength": 1},
+                    "expectedLaunchId": {"type": "string", "minLength": 1, "maxLength": 128},
                 },
             },
         }

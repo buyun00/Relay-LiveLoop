@@ -13,7 +13,7 @@
       "enum": [
         "status", "task.open", "task.update", "task.show", "observe",
         "source.locate", "source.edit", "component.preview", "component.revert",
-        "prepare", "task.approve", "iterate", "verify", "report",
+        "prepare", "task.approve", "iterate", "verify", "input.click", "input.text", "report",
         "baseline.build", "baseline.import", "player.start", "player.attach",
         "player.stop", "job.status", "job.cancel"
       ]
@@ -26,10 +26,10 @@
         "projectId": { "type": "string", "minLength": 1 },
         "workspaceId": { "type": "string", "minLength": 1 },
         "sessionId": { "type": "string", "minLength": 1 },
-        "expectedRuntimeRevision": { "type": "string", "minLength": 1 }
+        "expectedRuntimeRevision": { "type": "string", "minLength": 1 },
+        "expectedLaunchId": { "type": "string", "minLength": 1, "maxLength": 128 }
       }
     },
     "arguments": { "type": "object" }
   }
 }
-

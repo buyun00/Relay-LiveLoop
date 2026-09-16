@@ -134,12 +134,13 @@ internal static class SyntheticTests
             dispatcher.InitializeOnMainThread();
             var identity = new RuntimeSessionIdentity("session-frame", "launch-frame", "revision-frame", 1);
             var capture = new FreshFrameCaptureService();
-            capture.InitializeOnMainThread(identity, dispatcher, root, 4096);
+            capture.InitializeOnMainThread(identity, dispatcher, root, () => 1L, 4096);
             var request = new FreshFrameCaptureRequest
             {
                 ArtifactId = "frame-a",
                 ExpectedSessionId = identity.SessionId,
                 ExpectedRuntimeRevision = identity.RuntimeRevision,
+                ExpectedViewportGeneration = 1,
                 MinimumFrameExclusive = 100,
                 MaximumWidth = 64,
                 MaximumHeight = 64,

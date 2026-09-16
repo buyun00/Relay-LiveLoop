@@ -18,6 +18,33 @@ from host.service import CommandService
 from mcp.stdio_server import CURRENT_PROTOCOL, MCPServer, ToolCatalog
 
 
+EXPECTED_TOOL_NAMES = [
+    "relay_liveloop_baseline_build",
+    "relay_liveloop_baseline_import",
+    "relay_liveloop_component_preview",
+    "relay_liveloop_component_revert",
+    "relay_liveloop_input_click",
+    "relay_liveloop_input_text",
+    "relay_liveloop_iterate",
+    "relay_liveloop_job_cancel",
+    "relay_liveloop_job_status",
+    "relay_liveloop_observe",
+    "relay_liveloop_player_attach",
+    "relay_liveloop_player_start",
+    "relay_liveloop_player_stop",
+    "relay_liveloop_prepare",
+    "relay_liveloop_report",
+    "relay_liveloop_source_edit",
+    "relay_liveloop_source_locate",
+    "relay_liveloop_status",
+    "relay_liveloop_task_approve",
+    "relay_liveloop_task_open",
+    "relay_liveloop_task_show",
+    "relay_liveloop_task_update",
+    "relay_liveloop_verify",
+]
+
+
 def modern_meta() -> dict[str, Any]:
     return {
         "io.modelcontextprotocol/protocolVersion": CURRENT_PROTOCOL,
@@ -57,11 +84,9 @@ class MCPStdioTests(unittest.TestCase):
         self.ledger.close()
         self.temporary.cleanup()
 
-    def test_catalog_exposes_all_21_formal_operations(self) -> None:
+    def test_catalog_exposes_all_23_formal_operations(self) -> None:
         tools = self.catalog.tools
-        self.assertEqual(21, len(tools))
-        self.assertEqual(sorted(item["name"] for item in tools), [item["name"] for item in tools])
-        self.assertTrue(all(item["name"].startswith("relay_liveloop_") for item in tools))
+        self.assertEqual(EXPECTED_TOOL_NAMES, [item["name"] for item in tools])
         self.assertTrue(all("requestId" in item["inputSchema"]["required"] for item in tools))
 
     def test_current_stateless_tools_list_and_call(self) -> None:
@@ -75,7 +100,7 @@ class MCPStdioTests(unittest.TestCase):
             }
         )
         self.assertEqual("complete", listed["result"]["resultType"])
-        self.assertEqual(21, len(listed["result"]["tools"]))
+        self.assertEqual(EXPECTED_TOOL_NAMES, [item["name"] for item in listed["result"]["tools"]])
         called = server.handle(
             {
                 "jsonrpc": "2.0",
@@ -111,7 +136,7 @@ class MCPStdioTests(unittest.TestCase):
         self.assertEqual("2025-11-25", initialized["result"]["protocolVersion"])
         server.handle({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         listed = server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
-        self.assertEqual(21, len(listed["result"]["tools"]))
+        self.assertEqual(EXPECTED_TOOL_NAMES, [item["name"] for item in listed["result"]["tools"]])
 
     def test_actual_stdio_process_uses_newline_json_and_no_extra_stdout(self) -> None:
         script = Path(__file__).resolve().parents[1] / "mcp" / "stdio_server.py"
@@ -166,7 +191,7 @@ class MCPStdioTests(unittest.TestCase):
         self.assertEqual(3, len(lines), completed.stdout)
         responses = [json.loads(line) for line in lines]
         self.assertEqual([1, 2, 3], [item["id"] for item in responses])
-        self.assertEqual(21, len(responses[1]["result"]["tools"]))
+        self.assertEqual(EXPECTED_TOOL_NAMES, [item["name"] for item in responses[1]["result"]["tools"]])
         self.assertEqual("completed", responses[2]["result"]["structuredContent"]["status"])
 
 

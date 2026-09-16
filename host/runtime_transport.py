@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import CommandError
+from .validation import validate_command
+
+
+PLAYER_BOUND_OPERATIONS = frozenset({"observe", "verify", "input.click", "input.text"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +196,20 @@ class LoopbackRuntimeHostTransport:
                 runtime_changed=False,
                 recoverable=False,
             )
+        try:
+            normalized = validate_command(command)
+        except CommandError:
+            raise
+        if normalized["operation"] != operation:
+            raise CommandError(
+                "CONTRACT_MISMATCH",
+                "Runtime provider operation disagrees with the validated command operation.",
+                stage="runtime_transport_encode",
+                runtime_changed=False,
+                recoverable=False,
+                details={"providerOperation": operation, "commandOperation": normalized["operation"]},
+            )
+        command = normalized
         request_id = command.get("requestId")
         if not isinstance(request_id, str) or not request_id:
             raise CommandError(
@@ -201,6 +219,9 @@ class LoopbackRuntimeHostTransport:
                 runtime_changed=False,
                 recoverable=False,
             )
+        expected_context: dict[str, str] | None = None
+        if operation in PLAYER_BOUND_OPERATIONS:
+            expected_context = self._validate_player_context(command.get("context"), request_id)
         try:
             payload = json.dumps(
                 command,
@@ -217,7 +238,7 @@ class LoopbackRuntimeHostTransport:
                 runtime_changed=False,
                 recoverable=False,
             ) from exc
-        reply = self.invoke(request_id=request_id, operation=operation, payload=payload)
+        reply = self.invoke(request_id=request_id, operation=operation, payload=payload, expected_context=expected_context)
         if reply.media_type != "application/json":
             raise CommandError(
                 "CONTRACT_MISMATCH",
@@ -258,6 +279,7 @@ class LoopbackRuntimeHostTransport:
         operation: str,
         payload: bytes,
         timeout_seconds: float | None = None,
+        expected_context: dict[str, str] | None = None,
     ) -> RuntimeTransportReply:
         self._require_canonical(request_id, "request_id")
         self._require_canonical(operation, "operation")
@@ -275,6 +297,8 @@ class LoopbackRuntimeHostTransport:
 
         with self._command_lock:
             with self._state_lock:
+                if expected_context is not None:
+                    self._validate_player_context_locked(expected_context, request_id)
                 active = self._active_socket
                 connection_id = self._connection_id
                 key = bytes(self._connection_key) if self._connection_key is not None else None
@@ -627,6 +651,65 @@ class LoopbackRuntimeHostTransport:
             for index in range(len(self._connection_key)):
                 self._connection_key[index] = 0
         self._connection_key = None
+
+    def _validate_player_context(self, context: Any, request_id: str) -> dict[str, str]:
+        if not isinstance(context, dict):
+            raise CommandError(
+                "INVALID_REQUEST",
+                "Player-bound runtime commands require a context object.",
+                stage="runtime_transport_identity",
+                runtime_changed=False,
+                recoverable=False,
+                details={"requestId": request_id},
+            )
+        required = ("sessionId", "expectedRuntimeRevision", "expectedLaunchId")
+        if any(not isinstance(context.get(field), str) or not context[field] for field in required):
+            raise CommandError(
+                "INVALID_REQUEST",
+                "Player-bound runtime commands require session, runtime revision, and launch identity.",
+                stage="runtime_transport_identity",
+                runtime_changed=False,
+                recoverable=False,
+                details={"requestId": request_id},
+            )
+        normalized = {field: context[field] for field in required}
+        with self._state_lock:
+            self._validate_player_context_locked(normalized, request_id)
+        return normalized
+
+    def _validate_player_context_locked(self, context: dict[str, str], request_id: str) -> None:
+        current = {
+            "sessionId": self._expected_session_id,
+            "expectedRuntimeRevision": self._expected_runtime_revision,
+            "expectedLaunchId": self._expected_launch_id,
+        }
+        if context["sessionId"] != current["sessionId"]:
+            raise CommandError(
+                "WRONG_SESSION",
+                "Player-bound runtime command targets another session.",
+                stage="runtime_transport_identity",
+                runtime_changed=False,
+                recoverable=False,
+                details={"requestId": request_id},
+            )
+        if context["expectedRuntimeRevision"] != current["expectedRuntimeRevision"]:
+            raise CommandError(
+                "STALE_TARGET",
+                "Player-bound runtime command targets another runtime revision.",
+                stage="runtime_transport_identity",
+                runtime_changed=False,
+                recoverable=True,
+                details={"requestId": request_id},
+            )
+        if context["expectedLaunchId"] != current["expectedLaunchId"]:
+            raise CommandError(
+                "WRONG_SESSION",
+                "Player-bound runtime command targets another launch.",
+                stage="runtime_transport_identity",
+                runtime_changed=False,
+                recoverable=False,
+                details={"requestId": request_id},
+            )
 
     def _send_message(self, stream: socket.socket, value: dict[str, Any]) -> None:
         payload = json.dumps(
