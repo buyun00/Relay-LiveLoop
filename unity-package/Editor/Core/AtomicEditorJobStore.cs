@@ -486,7 +486,7 @@ namespace RelayLiveLoop
             var directory = Path.GetDirectoryName(destination);
             Directory.CreateDirectory(directory);
             var temporary = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            var bytes = new UTF8Encoding(false).GetBytes(JsonUtility.ToJson(value, true));
+            var bytes = new UTF8Encoding(false).GetBytes(SerializeJson(value));
             using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 stream.Write(bytes, 0, bytes.Length);
@@ -503,6 +503,33 @@ namespace RelayLiveLoop
             {
                 File.Move(temporary, destination);
             }
+        }
+
+        private static string SerializeJson<T>(T value)
+        {
+            var json = JsonUtility.ToJson(value, true);
+            var result = value is EditorJobResult ? (EditorJobResult)(object)value : null;
+            if (result == null || string.Equals(result.status, "completed", StringComparison.Ordinal) || result.resultJson != null)
+            {
+                return json;
+            }
+
+            // Unity JsonUtility emits a null string field as an empty string. The
+            // Editor result contract requires literal JSON null for failed results;
+            // completed results intentionally remain unchanged and are validated as
+            // requiring non-empty JSON by the Host transport.
+            var normalized = json.Replace("\"resultJson\": \"\"", "\"resultJson\": null");
+            if (normalized == json)
+            {
+                normalized = json.Replace("\"resultJson\":\"\"", "\"resultJson\":null");
+            }
+
+            if (normalized == json)
+            {
+                throw new InvalidDataException("Failed Editor result did not serialize a resultJson string field.");
+            }
+
+            return normalized;
         }
 
         private string GetAttemptPath(string jobId)

@@ -17,6 +17,7 @@ from host.runtime_session import load_runtime_session
 from host.runtime_transport import LoopbackRuntimeHostTransport
 from host.runtime_transport_provider import RuntimeTransportProvider
 from host.coordinator_binding import bind_shared_coordinator
+from host.player_process_composition import create_player_process_provider, load_player_process_config
 from host.validation import OPERATIONS
 
 TOKEN_ENV = "RELAY_LIVELOOP_TOKEN"
@@ -72,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost", "::1"))
     serve.add_argument("--port", type=int, default=18760)
     serve.add_argument("--runtime-session-file", help="Protected JSON handoff for one authenticated Development Player session.")
+    serve.add_argument("--machine-config", help="Machine config containing the playerProcess composition paths.")
     _common_security(serve)
 
     command = subparsers.add_parser("command", help="Send one protocol command to the local host.")
@@ -104,9 +106,22 @@ def build_command_service(
     providers=None,
     preparation_provider=None,
     runtime_provider=None,
+    player_process_provider=None,
 ) -> CommandService:
     """Construct the shared service and attach its single optional coordinator owner."""
-    service = CommandService(ledger, artifacts, providers=providers)
+    provider_registry = providers
+    if player_process_provider is not None:
+        if provider_registry is None:
+            from host.providers import ProviderRegistry
+
+            provider_registry = ProviderRegistry()
+        provider_registry.register(
+            "player_process",
+            player_process_provider.provider_id,
+            player_process_provider,
+            verified=player_process_provider.is_verified,
+        )
+    service = CommandService(ledger, artifacts, providers=provider_registry)
     binding = bind_shared_coordinator(service, preparation_provider, runtime_provider)
     service.coordinator_binding = binding
     return service
@@ -119,11 +134,20 @@ def _serve(args: argparse.Namespace) -> int:
         root = Path(value).resolve()
         root.mkdir(parents=True, exist_ok=True)
         roots.append(root)
+    machine_config = load_player_process_config(args.machine_config) if args.machine_config else None
+    runtime_session_file = args.runtime_session_file
+    if machine_config is not None:
+        configured_session_file = machine_config.runtime_session_file
+        if runtime_session_file is None:
+            runtime_session_file = str(configured_session_file)
+        elif Path(runtime_session_file).expanduser().resolve(strict=False) != configured_session_file:
+            raise ValueError("--runtime-session-file must match playerProcess.runtimeSessionFile.")
     ledger = Ledger(args.database)
+    artifacts = ArtifactStore(ledger, roots)
     runtime_transport = None
     providers = None
-    if args.runtime_session_file:
-        session = load_runtime_session(args.runtime_session_file)
+    if runtime_session_file:
+        session = load_runtime_session(runtime_session_file)
         runtime_transport = LoopbackRuntimeHostTransport(
             shared_secret=session.shared_secret,
             expected_session_id=session.session_id,
@@ -140,7 +164,20 @@ def _serve(args: argparse.Namespace) -> int:
         providers.register("observation", "development-player-observation", player, verified=True)
         verification = RuntimeTransportProvider(runtime_transport, {"verify", "input.click", "input.text"})
         providers.register("verification", "development-player-verification", verification, verified=True)
-    service = build_command_service(ledger, ArtifactStore(ledger, roots), providers=providers)
+    player_process_provider = None
+    if machine_config is not None:
+        player_process_provider = create_player_process_provider(
+            config=machine_config,
+            ledger=ledger,
+            artifacts=artifacts,
+            runtime_transport=runtime_transport,
+        )
+    service = build_command_service(
+        ledger,
+        artifacts,
+        providers=providers,
+        player_process_provider=player_process_provider,
+    )
     server = create_http_server(service, token, args.host, args.port)
     try:
         server.serve_forever(poll_interval=0.25)
