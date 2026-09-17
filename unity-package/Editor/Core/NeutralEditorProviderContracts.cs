@@ -12,6 +12,8 @@ namespace RelayLiveLoop
         public List<string> defines = new List<string>();
         public List<string> references = new List<string>();
         public List<string> sourceInputs = new List<string>();
+        // Opaque project-adapter context. Kept out of the neutral contract's type system.
+        public string providerContextJson;
     }
 
     [Serializable]

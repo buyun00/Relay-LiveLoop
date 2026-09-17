@@ -16,12 +16,29 @@ namespace RelayLiveLoop
             string launchId,
             string runtimeRevision,
             int protocolVersion)
+            : this(sessionId, launchId, runtimeRevision, protocolVersion, null)
+        {
+        }
+
+        public RuntimeSessionIdentity(
+            string sessionId,
+            string launchId,
+            string runtimeRevision,
+            int protocolVersion,
+            string resourceReleaseId)
         {
             SessionId = RequireCanonicalValue(sessionId, nameof(sessionId));
             LaunchId = RequireCanonicalValue(launchId, nameof(launchId));
             _runtimeRevisions = new RuntimeRevisionClock(runtimeRevision);
             if (protocolVersion <= 0) throw new ArgumentOutOfRangeException(nameof(protocolVersion));
             ProtocolVersion = protocolVersion;
+            if (resourceReleaseId != null && resourceReleaseId.IndexOf('\0') >= 0)
+            {
+                throw new ArgumentException("Value contains a protocol separator.", nameof(resourceReleaseId));
+            }
+            ResourceReleaseId = resourceReleaseId == null
+                ? null
+                : RequireCanonicalValue(resourceReleaseId, nameof(resourceReleaseId));
         }
 
         public string SessionId { get; private set; }
@@ -29,6 +46,7 @@ namespace RelayLiveLoop
         public string RuntimeRevision { get { return _runtimeRevisions.CurrentRevision; } }
         public IRuntimeRevisionSource RuntimeRevisions { get { return _runtimeRevisions; } }
         public int ProtocolVersion { get; private set; }
+        public string ResourceReleaseId { get; private set; }
 
         internal RuntimeRevisionClock BindRuntimeRevisionAuthority(
             IRelayLiveLoopMainThreadGuard mainThread)

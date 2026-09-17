@@ -13,9 +13,12 @@ from clients.http_client import RelayHTTPClient, RelayHTTPError
 from host.artifacts import ArtifactStore
 from host.ledger import Ledger
 from host.service import CommandService
+from host.editor_transport import EditorJobTransport
+from host.native_compile_profile import NativeCompileProfileRegistry
 from host.runtime_session import load_runtime_session
 from host.runtime_transport import LoopbackRuntimeHostTransport
 from host.runtime_transport_provider import RuntimeTransportProvider
+from host.runtime_update_provider import MAX_RUNTIME_FRAME_BYTES, create_native_update_providers
 from host.coordinator_binding import bind_shared_coordinator
 from host.player_process_composition import create_player_process_provider, load_player_process_config
 from host.validation import OPERATIONS
@@ -74,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=18760)
     serve.add_argument("--runtime-session-file", help="Protected JSON handoff for one authenticated Development Player session.")
     serve.add_argument("--machine-config", help="Machine config containing the playerProcess composition paths.")
+    serve.add_argument("--native-compile-profiles", help="Server-owned source/baseline profile registry required with --runtime-session-file.")
+    serve.add_argument("--editor-job-root", help="Durable incoming/processing/results root for the existing Editor worker transport.")
+    serve.add_argument("--editor-artifact-root", help="Editor compile artifact directory contained by one configured --artifact-root.")
     _common_security(serve)
 
     command = subparsers.add_parser("command", help="Send one protocol command to the local host.")
@@ -122,7 +128,18 @@ def build_command_service(
             verified=player_process_provider.is_verified,
         )
     service = CommandService(ledger, artifacts, providers=provider_registry)
-    binding = bind_shared_coordinator(service, preparation_provider, runtime_provider)
+    def coordinator_availability_probe(capability: str, provider: Any) -> bool:
+        probe = getattr(provider, "probe_capability", None)
+        if callable(probe):
+            return bool(probe(capability))
+        return bool(getattr(provider, "is_verified", False))
+
+    binding = bind_shared_coordinator(
+        service,
+        preparation_provider,
+        runtime_provider,
+        availability_probe=coordinator_availability_probe,
+    )
     service.coordinator_binding = binding
     return service
 
@@ -142,10 +159,29 @@ def _serve(args: argparse.Namespace) -> int:
             runtime_session_file = str(configured_session_file)
         elif Path(runtime_session_file).expanduser().resolve(strict=False) != configured_session_file:
             raise ValueError("--runtime-session-file must match playerProcess.runtimeSessionFile.")
+    profile_path = getattr(args, "native_compile_profiles", None)
+    editor_job_path = getattr(args, "editor_job_root", None)
+    editor_artifact_path = getattr(args, "editor_artifact_root", None)
+    configured_compile_values = (profile_path, editor_job_path, editor_artifact_path)
+    if runtime_session_file and any(not value for value in configured_compile_values):
+        raise ValueError("--runtime-session-file requires --native-compile-profiles, --editor-job-root, and --editor-artifact-root; manual manifest preparation is disabled for Player-bound Host service.")
+    if not runtime_session_file and any(configured_compile_values):
+        raise ValueError("Native compile preparation requires --runtime-session-file and its authenticated Player session.")
+    compile_profiles = None
+    editor_transport = None
+    if runtime_session_file:
+        compile_profiles = NativeCompileProfileRegistry.load(profile_path)
+        editor_job_root = Path(editor_job_path).expanduser().resolve(strict=False)
+        editor_artifact_root = Path(editor_artifact_path).expanduser().resolve(strict=False)
+        if not any(editor_artifact_root == root or root in editor_artifact_root.parents for root in roots):
+            raise ValueError("--editor-artifact-root must be equal to or contained by a configured --artifact-root.")
+        editor_transport = EditorJobTransport(editor_job_root, editor_artifact_root)
     ledger = Ledger(args.database)
     artifacts = ArtifactStore(ledger, roots)
     runtime_transport = None
     providers = None
+    preparation_provider = None
+    runtime_provider = None
     if runtime_session_file:
         session = load_runtime_session(runtime_session_file)
         runtime_transport = LoopbackRuntimeHostTransport(
@@ -156,6 +192,7 @@ def _serve(args: argparse.Namespace) -> int:
             protocol_version=session.protocol_version,
             listen_address=session.host_address,
             port=session.port,
+            maximum_frame_bytes=MAX_RUNTIME_FRAME_BYTES,
         )
         from host.providers import ProviderRegistry
         providers = ProviderRegistry()
@@ -164,6 +201,14 @@ def _serve(args: argparse.Namespace) -> int:
         providers.register("observation", "development-player-observation", player, verified=True)
         verification = RuntimeTransportProvider(runtime_transport, {"verify", "input.click", "input.text"})
         providers.register("verification", "development-player-verification", verification, verified=True)
+        preparation_provider, runtime_provider = create_native_update_providers(
+            runtime_transport,
+            artifacts,
+            session,
+            ledger=ledger,
+            profiles=compile_profiles,
+            editor_transport=editor_transport,
+        )
     player_process_provider = None
     if machine_config is not None:
         player_process_provider = create_player_process_provider(
@@ -176,10 +221,14 @@ def _serve(args: argparse.Namespace) -> int:
         ledger,
         artifacts,
         providers=providers,
+        preparation_provider=preparation_provider,
+        runtime_provider=runtime_provider,
         player_process_provider=player_process_provider,
     )
     server = create_http_server(service, token, args.host, args.port)
     try:
+        if service.coordinator is not None:
+            service.coordinator.recover_pending()
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         pass

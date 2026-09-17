@@ -28,8 +28,8 @@ class RuntimeTransportReply:
     schema_version: int
     media_type: str
     payload: bytes
-    runtime_changed: bool
-    runtime_revision_after: str
+    runtime_changed: bool | None
+    runtime_revision_after: str | None
 
 
 class LoopbackRuntimeHostTransport:
@@ -128,6 +128,13 @@ class LoopbackRuntimeHostTransport:
                 "expectedRuntimeRevision": self._expected_runtime_revision,
                 "nativeCapabilitiesVerified": False,
             }
+
+    def retire_session(self) -> None:
+        """Discard the authenticated channel after an inner/outer terminal contradiction."""
+        with self._state_lock:
+            active = self._active_socket
+        if active is not None:
+            self._discard_session(active)
 
     def start(self) -> None:
         with self._state_lock:
@@ -386,7 +393,13 @@ class LoopbackRuntimeHostTransport:
                     },
                 )
             if response.get("kind") == "error":
-                raise self._wire_error(response)
+                error = self._wire_error(response)
+                if error.runtime_changed is None:
+                    # An error envelope with unknown attribution is just as ambiguous as an
+                    # unknown-attribution response.  Retire the authenticated session before
+                    # the coordinator can attempt diagnostics or another task on this channel.
+                    self._discard_session(active)
+                raise error
             if response.get("kind") != "response":
                 self._discard_session(active)
                 raise CommandError(
@@ -400,12 +413,19 @@ class LoopbackRuntimeHostTransport:
 
             try:
                 runtime_changed_known = self._required_bool(response, "runtimeChangedKnown")
-                if not runtime_changed_known:
-                    raise ValueError("A successful response must have known runtimeChanged truth.")
-                runtime_changed = self._required_bool(response, "runtimeChanged")
+                if runtime_changed_known:
+                    runtime_changed: bool | None = self._required_bool(response, "runtimeChanged")
+                    runtime_revision: str | None = self._required_string(response, "runtimeRevision")
+                else:
+                    runtime_changed = None
+                    if response.get("runtimeChanged") is not None:
+                        raise ValueError("Unknown runtimeChanged truth must not include a boolean value.")
+                    raw_revision = response.get("runtimeRevision")
+                    if raw_revision is not None and (not isinstance(raw_revision, str) or not raw_revision):
+                        raise ValueError("runtimeRevision must be a non-empty string or null.")
+                    runtime_revision = raw_revision
                 schema_id = self._required_string(response, "schemaId")
                 media_type = self._required_string(response, "mediaType")
-                runtime_revision = self._required_string(response, "runtimeRevision")
                 schema_version = response.get("schemaVersion")
                 if type(schema_version) is not int or schema_version <= 0:
                     raise ValueError("schemaVersion must be a positive integer.")
@@ -417,6 +437,10 @@ class LoopbackRuntimeHostTransport:
                     "Player terminal response fields do not match the runtime transport contract.",
                     known_change if type(known_change) is bool else None,
                 ) from exc
+            if runtime_changed is None:
+                # Preserve the terminal unknown attribution, but discard this connection so an
+                # in-session command cannot mistake the old expected revision for a clean state.
+                self._discard_session(active)
             return RuntimeTransportReply(
                 request_id=request_id,
                 schema_id=schema_id,

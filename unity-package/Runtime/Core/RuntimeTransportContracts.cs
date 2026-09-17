@@ -1,6 +1,9 @@
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
 
 namespace RelayLiveLoop
 {
@@ -216,6 +219,11 @@ namespace RelayLiveLoop
                         revisionAfter);
                 }
 
+                if (IsExplicitUnknownTerminal(result.Value, out var status))
+                {
+                    return UnknownTerminal(revisionAfter, status);
+                }
+
                 return RuntimeTransportExecutionResult.Completed(
                     result.Value,
                     runtimeChanged,
@@ -307,6 +315,10 @@ namespace RelayLiveLoop
             }
             if (result.Succeeded && result.Value != null)
             {
+                if (IsExplicitUnknownTerminal(result.Value, out var status))
+                {
+                    return UnknownTerminal(revisionAfter, status);
+                }
                 return RuntimeTransportExecutionResult.Completed(result.Value, runtimeChanged, revisionAfter);
             }
             if (!result.Succeeded && result.Error != null)
@@ -330,6 +342,68 @@ namespace RelayLiveLoop
                     "runtime_transport_execute", "The asynchronous handler returned an invalid result.", false,
                     runtimeChanged ? (bool?)true : false), revisionAfter);
         }
+
+        private static bool IsExplicitUnknownTerminal(NeutralPayload payload, out string status)
+        {
+            status = null;
+            if (payload == null || payload.SchemaId != "relay.liveloop.command-result" ||
+                payload.SchemaVersion != 1 || payload.MediaType != "application/json")
+            {
+                return false;
+            }
+
+            try
+            {
+                var serializer = new DataContractJsonSerializer(typeof(NeutralCommandTerminal));
+                using (var stream = new MemoryStream(payload.Bytes, false))
+                {
+                    var terminal = serializer.ReadObject(stream) as NeutralCommandTerminal;
+                    if (terminal == null) return true;
+                    status = terminal.Status;
+                    return string.Equals(terminal.Status, "state_unknown", StringComparison.Ordinal) ||
+                        !terminal.RuntimeChanged.HasValue ||
+                        string.Equals(terminal.Error?.Code, "STATE_UNKNOWN", StringComparison.Ordinal);
+                }
+            }
+            catch (Exception)
+            {
+                // A command-result-shaped payload that cannot express its terminal state is
+                // not safe to downgrade to a known unchanged transport response.
+                status = "invalid";
+                return true;
+            }
+        }
+
+        private static RuntimeTransportExecutionResult UnknownTerminal(string revisionAfter, string status)
+        {
+            return RuntimeTransportExecutionResult.Failed(
+                RelayLiveLoopErrors.Create(
+                    RelayLiveLoopErrorCode.StateUnknown,
+                    "runtime_transport_execute",
+                    "The neutral command payload explicitly reports unknown runtime state or nullable attribution.",
+                    false,
+                    null,
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        { "neutralStatus", status ?? "missing" },
+                        { "freshSessionRequired", "true" }
+                    }),
+                revisionAfter);
+        }
+    }
+
+    [DataContract]
+    internal sealed class NeutralCommandTerminal
+    {
+        [DataMember(Name = "status", EmitDefaultValue = false)] public string Status;
+        [DataMember(Name = "runtimeChanged", EmitDefaultValue = false)] public bool? RuntimeChanged;
+        [DataMember(Name = "error", EmitDefaultValue = false)] public NeutralCommandTerminalError Error;
+    }
+
+    [DataContract]
+    internal sealed class NeutralCommandTerminalError
+    {
+        [DataMember(Name = "code", EmitDefaultValue = false)] public string Code;
     }
 }
 #endif

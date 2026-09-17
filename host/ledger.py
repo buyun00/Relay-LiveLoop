@@ -637,6 +637,33 @@ class Ledger:
             )
         return {"versionId": version_id, **record}
 
+    def latest_version(self, session_id: str, scope: str, subject: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM versions
+                WHERE session_id = ? AND scope = ? AND subject = ?
+                ORDER BY generation DESC, created_at DESC
+                LIMIT 1
+                """,
+                (session_id, scope, subject),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "versionId": row["version_id"],
+            "sessionId": row["session_id"],
+            "scope": row["scope"],
+            "subject": row["subject"],
+            "generation": row["generation"],
+            "revision": row["revision"],
+            "artifactId": row["artifact_id"],
+            "appliedPlanId": row["applied_plan_id"],
+            "state": row["state"],
+            "metadata": load_json(row["metadata_json"], {}),
+            "createdAt": row["created_at"],
+        }
+
     def set_method_state(self, record: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
         values = (

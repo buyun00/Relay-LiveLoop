@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -67,6 +68,7 @@ class ArtifactStore:
         expected_sha256: str | None = None,
         expected_size: int | None = None,
         media_type: str | None = None,
+        artifact_id: str | None = None,
         task_id: str | None = None,
         job_id: str | None = None,
         plan_id: str | None = None,
@@ -74,6 +76,8 @@ class ArtifactStore:
         scoped = self._resolve_scoped(path)
         if not ID_RE.fullmatch(kind):
             raise CommandError("CONTRACT_MISMATCH", "Artifact kind contains unsupported characters.", stage="artifact")
+        if artifact_id is not None and (not isinstance(artifact_id, str) or not ID_RE.fullmatch(artifact_id)):
+            raise CommandError("CONTRACT_MISMATCH", "artifact_id contains unsupported characters.", stage="artifact")
         digest, size = sha256_file(scoped)
         if expected_sha256 is not None:
             if not SHA256_RE.fullmatch(expected_sha256):
@@ -90,6 +94,20 @@ class ArtifactStore:
             raise CommandError("CONTRACT_MISMATCH", "Artifact media_type must be a bounded type/subtype token.", stage="artifact")
         record = self.ledger.register_artifact(
             {
+                "artifactId": artifact_id,
+                "taskId": task_id,
+                "jobId": job_id,
+                "planId": plan_id,
+                "absolutePath": str(scoped),
+                "sha256": digest,
+                "sizeBytes": size,
+                "kind": kind,
+                "mediaType": effective_media_type,
+                "originalName": scoped.name,
+            }
+        ) if artifact_id is None else self._register_idempotently(
+            {
+                "artifactId": artifact_id,
                 "taskId": task_id,
                 "jobId": job_id,
                 "planId": plan_id,
@@ -102,6 +120,32 @@ class ArtifactStore:
             }
         )
         return self.public_metadata(record)
+
+    def _register_idempotently(self, record: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = record["artifactId"]
+        try:
+            return self.ledger.register_artifact(record)
+        except sqlite3.IntegrityError:
+            existing = self.ledger.get_artifact(artifact_id)
+            expected = {
+                "taskId": record.get("taskId"),
+                "jobId": record.get("jobId"),
+                "planId": record.get("planId"),
+                "absolutePath": record["absolutePath"],
+                "sha256": record["sha256"],
+                "sizeBytes": record["sizeBytes"],
+                "kind": record["kind"],
+                "mediaType": record["mediaType"],
+                "originalName": record["originalName"],
+            }
+            if any(existing.get(key) != value for key, value in expected.items()):
+                raise CommandError(
+                    "INPUT_CHANGED",
+                    "An idempotent artifact identity is already bound to different bytes or ownership.",
+                    stage="artifact",
+                    recoverable=False,
+                )
+            return existing
 
     @staticmethod
     def public_metadata(record: dict[str, Any]) -> dict[str, Any]:

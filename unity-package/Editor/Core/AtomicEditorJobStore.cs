@@ -52,6 +52,7 @@ namespace RelayLiveLoop
         private readonly string _results;
         private readonly string _archive;
         private readonly string _invalid;
+        private readonly string _attemptTombstones;
 
         public AtomicEditorJobStore(string root, string allowedArtifactRoot)
         {
@@ -62,11 +63,13 @@ namespace RelayLiveLoop
             _results = Path.Combine(_root, "results");
             _archive = Path.Combine(_root, "archive");
             _invalid = Path.Combine(_root, "invalid");
+            _attemptTombstones = Path.Combine(_root, "attempt-tombstones");
             Directory.CreateDirectory(_incoming);
             Directory.CreateDirectory(_processing);
             Directory.CreateDirectory(_results);
             Directory.CreateDirectory(_archive);
             Directory.CreateDirectory(_invalid);
+            Directory.CreateDirectory(_attemptTombstones);
             Directory.CreateDirectory(_allowedArtifactRoot);
         }
 
@@ -125,8 +128,32 @@ namespace RelayLiveLoop
                     }
                 }
 
+                var tombstonePath = GetAttemptTombstonePath(request.jobId);
+                if (File.Exists(tombstonePath))
+                {
+                    string tombstoneProblem;
+                    var tombstone = ReadAttemptTombstone(request.jobId, out tombstoneProblem);
+                    if (!string.IsNullOrEmpty(tombstoneProblem) ||
+                        !AttemptMatchesRequest(tombstone, request, digest))
+                    {
+                        if (File.Exists(attemptPath)) PreserveInvalid(attemptPath, "attempt-tombstone-mismatch");
+                        PreserveInvalid(files[index], "attempt-tombstone-mismatch");
+                        continue;
+                    }
+
+                    if (attempt == null)
+                    {
+                        attempt = tombstone;
+                        recoveryProblem = "A durable prior-attempt tombstone exists without a live processing attempt; fresh Begin is forbidden.";
+                    }
+                    else if (!SameAttempt(attempt, tombstone))
+                    {
+                        recoveryProblem = "The active attempt differs from its durable prior-attempt tombstone.";
+                    }
+                }
+
                 // No attempt record means the atomic claim completed but provider execution never
-                // became eligible. A fresh attempt can be created without replaying work.
+                // became eligible only when no durable attempt tombstone exists.
                 return new EditorJobClaim(request, digest, files[index], attempt, attempt != null, recoveryProblem);
             }
 
@@ -156,6 +183,37 @@ namespace RelayLiveLoop
                     continue;
                 }
 
+                var tombstonePath = GetAttemptTombstonePath(request.jobId);
+                if (File.Exists(tombstonePath))
+                {
+                    string tombstoneProblem;
+                    var tombstone = ReadAttemptTombstone(request.jobId, out tombstoneProblem);
+                    if (!string.IsNullOrEmpty(tombstoneProblem) ||
+                        !AttemptMatchesRequest(tombstone, request, digest))
+                    {
+                        PreserveInvalid(files[index], "attempt-tombstone-mismatch");
+                        continue;
+                    }
+
+                    var duplicateProcessingPath = Path.Combine(_processing, request.jobId + ".request.json");
+                    try
+                    {
+                        File.Move(files[index], duplicateProcessingPath);
+                    }
+                    catch (IOException)
+                    {
+                        continue;
+                    }
+
+                    return new EditorJobClaim(
+                        request,
+                        digest,
+                        duplicateProcessingPath,
+                        tombstone,
+                        true,
+                        "A durable prior-attempt tombstone exists; fresh Begin is forbidden.");
+                }
+
                 var processingPath = Path.Combine(_processing, request.jobId + ".request.json");
                 try
                 {
@@ -175,7 +233,24 @@ namespace RelayLiveLoop
         public EditorJobAttemptRecord BeginAttempt(EditorJobClaim claim)
         {
             if (claim == null) throw new ArgumentNullException(nameof(claim));
-            if (claim.Attempt != null) return claim.Attempt;
+            if (claim.Attempt != null)
+            {
+                if (string.IsNullOrEmpty(claim.RecoveryProblem)) PersistAttemptTombstone(claim.Attempt);
+                return claim.Attempt;
+            }
+            var tombstonePath = GetAttemptTombstonePath(claim.Request.jobId);
+            if (File.Exists(tombstonePath))
+            {
+                string tombstoneProblem;
+                var prior = ReadAttemptTombstone(claim.Request.jobId, out tombstoneProblem);
+                if (!string.IsNullOrEmpty(tombstoneProblem) || !AttemptMatchesRequest(prior, claim.Request, claim.RequestDigest))
+                {
+                    throw new InvalidDataException("A prior-attempt tombstone prevents a fresh attempt for this job id.");
+                }
+
+                claim.Attempt = prior;
+                return prior;
+            }
             var attemptId = Guid.NewGuid().ToString("N");
             var inputSegment = claim.RequestDigest.Substring(0, 16);
             var artifactRoot = Path.GetFullPath(claim.Request.artifactRoot);
@@ -198,6 +273,7 @@ namespace RelayLiveLoop
                 state = "started"
             };
             AtomicWriteJson(GetAttemptPath(claim.Request.jobId), attempt);
+            PersistAttemptTombstone(attempt);
             claim.Attempt = attempt;
             return attempt;
         }
@@ -535,6 +611,117 @@ namespace RelayLiveLoop
         private string GetAttemptPath(string jobId)
         {
             return Path.Combine(_processing, jobId + ".attempt.json");
+        }
+
+        private string GetAttemptTombstonePath(string jobId)
+        {
+            return Path.Combine(_attemptTombstones, jobId + ".attempt.json");
+        }
+
+        private EditorJobAttemptRecord ReadAttemptTombstone(string jobId, out string problem)
+        {
+            problem = null;
+            var path = GetAttemptTombstonePath(jobId);
+            try
+            {
+                var value = JsonUtility.FromJson<EditorJobAttemptRecord>(File.ReadAllText(path, Encoding.UTF8));
+                if (value == null ||
+                    !string.Equals(value.jobId, jobId, StringComparison.Ordinal) ||
+                    !IsSha256(value.requestDigest) ||
+                    string.IsNullOrWhiteSpace(value.inputSnapshot) ||
+                    !IsSafeIdentifier(value.providerId) ||
+                    !IsSafeIdentifier(value.attemptId) ||
+                    string.IsNullOrWhiteSpace(value.attemptRoot) ||
+                    string.IsNullOrWhiteSpace(value.startedAtUtc) ||
+                    string.IsNullOrWhiteSpace(value.state))
+                {
+                    problem = "Attempt tombstone fields are invalid.";
+                    return null;
+                }
+
+                EnsureContained(_allowedArtifactRoot, value.attemptRoot, "Attempt tombstone root escaped the configured artifact root.");
+                return value;
+            }
+            catch (Exception ex)
+            {
+                problem = "Attempt tombstone cannot be read: " + ex.GetType().Name;
+                return null;
+            }
+        }
+
+        private void PersistAttemptTombstone(EditorJobAttemptRecord attempt)
+        {
+            var path = GetAttemptTombstonePath(attempt.jobId);
+            if (File.Exists(path))
+            {
+                string problem;
+                var existing = ReadAttemptTombstone(attempt.jobId, out problem);
+                if (!string.IsNullOrEmpty(problem) || !SameAttempt(existing, attempt))
+                {
+                    throw new InvalidDataException("Durable attempt tombstone differs from the active attempt.");
+                }
+                return;
+            }
+
+            var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            var bytes = new UTF8Encoding(false).GetBytes(SerializeJson(attempt));
+            try
+            {
+                using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush(true);
+                }
+
+                try
+                {
+                    File.Move(temporary, path);
+                }
+                catch (IOException)
+                {
+                    if (!File.Exists(path)) throw;
+                    string problem;
+                    var existing = ReadAttemptTombstone(attempt.jobId, out problem);
+                    if (!string.IsNullOrEmpty(problem) || !SameAttempt(existing, attempt)) throw;
+                }
+            }
+            finally
+            {
+                if (File.Exists(temporary)) File.Delete(temporary);
+            }
+        }
+
+        private static bool AttemptMatchesRequest(EditorJobAttemptRecord attempt, EditorJobRequest request, string digest)
+        {
+            return attempt != null && request != null &&
+                string.Equals(attempt.jobId, request.jobId, StringComparison.Ordinal) &&
+                string.Equals(attempt.requestDigest, digest, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(attempt.inputSnapshot, request.inputSnapshot, StringComparison.Ordinal) &&
+                string.Equals(attempt.providerId, request.providerId, StringComparison.Ordinal);
+        }
+
+        private static bool SameAttempt(EditorJobAttemptRecord left, EditorJobAttemptRecord right)
+        {
+            return left != null && right != null &&
+                string.Equals(left.jobId, right.jobId, StringComparison.Ordinal) &&
+                string.Equals(left.requestDigest, right.requestDigest, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(left.inputSnapshot, right.inputSnapshot, StringComparison.Ordinal) &&
+                string.Equals(left.providerId, right.providerId, StringComparison.Ordinal) &&
+                string.Equals(left.attemptId, right.attemptId, StringComparison.Ordinal) &&
+                string.Equals(left.attemptRoot, right.attemptRoot, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(left.startedAtUtc, right.startedAtUtc, StringComparison.Ordinal) &&
+                string.Equals(left.state, right.state, StringComparison.Ordinal);
+        }
+
+        private static bool IsSha256(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length != 64) return false;
+            for (var index = 0; index < value.Length; index++)
+            {
+                var c = value[index];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            }
+            return true;
         }
 
         private void PreserveInvalid(string source, string label)

@@ -62,10 +62,21 @@ class EditorJobTransport:
         self._incoming = self._job_root / "incoming"
         self._processing = self._job_root / "processing"
         self._results = self._job_root / "results"
-        for directory in (self._incoming, self._processing, self._results, self._artifact_root):
+        self._submissions = self._job_root / "submissions"
+        for directory in (self._incoming, self._processing, self._results, self._submissions, self._artifact_root):
             directory.mkdir(parents=True, exist_ok=True)
 
-    def enqueue(self, envelope: EditorJobEnvelope) -> EditorJobTicket:
+    @property
+    def job_root(self) -> Path:
+        return self._job_root
+
+    @property
+    def artifact_root(self) -> Path:
+        return self._artifact_root
+
+    def enqueue(self, envelope: EditorJobEnvelope, *, allow_submit: bool = True) -> EditorJobTicket:
+        if type(allow_submit) is not bool:
+            self._contract_mismatch("allow_submit must be a boolean.")
         body = self._encode_request(envelope)
         digest = hashlib.sha256(body).hexdigest()
         ticket = EditorJobTicket(
@@ -79,6 +90,7 @@ class EditorJobTransport:
         existing = self._find_existing_request(envelope.job_id)
         if existing is not None:
             self._require_same_request(existing, body)
+            self._ensure_submission_tombstone(ticket)
             return ticket
 
         result_path = self._result_path(envelope.job_id)
@@ -86,9 +98,21 @@ class EditorJobTransport:
             result = self._read_and_validate_result(result_path, ticket)
             if result["requestDigest"] != digest:
                 self._input_changed(envelope.job_id)
+            self._ensure_submission_tombstone(ticket)
             return ticket
 
+        tombstone_path = self._submission_path(envelope.job_id)
+        if tombstone_path.exists():
+            self._require_same_submission_tombstone(tombstone_path, ticket)
+            self._unknown_missing_submission(envelope.job_id, digest)
+        if not allow_submit:
+            self._unknown_missing_submission(envelope.job_id, digest)
+
         self._require_unexpired(envelope.expires_at_utc)
+        if not self._create_submission_tombstone(ticket):
+            # Another Host process reserved this job identity. It may publish the
+            # request, but this caller must not create a competing mailbox entry.
+            self._unknown_missing_submission(envelope.job_id, digest)
         destination = self._request_path(self._incoming, envelope.job_id)
         temporary = self._incoming / f".{envelope.job_id}.{uuid.uuid4().hex}.tmp"
         try:
@@ -113,6 +137,78 @@ class EditorJobTransport:
             envelope.input_snapshot,
             envelope.provider_id,
             True,
+        )
+
+    def _create_submission_tombstone(self, ticket: EditorJobTicket) -> bool:
+        path = self._submission_path(ticket.job_id)
+        body = self._submission_tombstone_bytes(ticket)
+        temporary = self._submissions / f".{ticket.job_id}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(body)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                self._require_same_submission_tombstone(path, ticket)
+                return False
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        return True
+
+    def _ensure_submission_tombstone(self, ticket: EditorJobTicket) -> None:
+        path = self._submission_path(ticket.job_id)
+        if path.exists():
+            self._require_same_submission_tombstone(path, ticket)
+            return
+        self._create_submission_tombstone(ticket)
+
+    def _require_same_submission_tombstone(self, path: Path, ticket: EditorJobTicket) -> None:
+        raw = self._read_bounded(path, 4096, "Editor submission tombstone")
+        try:
+            value = self._json_loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._contract_mismatch(f"Editor submission tombstone is invalid JSON: {exc}.")
+        expected = {
+            "schema": "relay.liveloop.editor-dispatch-tombstone",
+            "version": 1,
+            "jobId": ticket.job_id,
+            "requestDigest": ticket.request_digest,
+            "inputSnapshot": ticket.input_snapshot,
+            "providerId": ticket.provider_id,
+        }
+        if value != expected:
+            self._input_changed(ticket.job_id)
+
+    @staticmethod
+    def _submission_tombstone_bytes(ticket: EditorJobTicket) -> bytes:
+        value = {
+            "schema": "relay.liveloop.editor-dispatch-tombstone",
+            "version": 1,
+            "jobId": ticket.job_id,
+            "requestDigest": ticket.request_digest,
+            "inputSnapshot": ticket.input_snapshot,
+            "providerId": ticket.provider_id,
+        }
+        return json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    def _unknown_missing_submission(self, job_id: str, request_digest: str) -> None:
+        raise CommandError(
+            "STATE_UNKNOWN",
+            "Editor job has no live request or durable result; a fresh compile request was not written.",
+            stage="editor_enqueue",
+            runtime_changed=False,
+            recoverable=False,
+            details={
+                "jobId": job_id,
+                "requestDigest": request_digest,
+                "automaticCompileReplayAllowed": False,
+                "newRequestWritten": False,
+            },
         )
 
     def poll_result(self, ticket: EditorJobTicket) -> dict[str, Any] | None:
@@ -439,6 +535,9 @@ class EditorJobTransport:
     @staticmethod
     def _request_path(directory: Path, job_id: str) -> Path:
         return directory / f"{job_id}.request.json"
+
+    def _submission_path(self, job_id: str) -> Path:
+        return self._submissions / f"{job_id}.submitted.json"
 
     def _result_path(self, job_id: str) -> Path:
         return self._results / f"{job_id}.result.json"

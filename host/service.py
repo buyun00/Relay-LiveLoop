@@ -122,6 +122,10 @@ class CommandService:
                     runtime_changed=False,
                 )
             try:
+                if command["operation"] in {"prepare", "iterate", "status"}:
+                    binding = getattr(self, "coordinator_binding", None)
+                    if binding is not None:
+                        binding.refresh()
                 disposition, stored = self.ledger.begin_command(
                     request_id,
                     command_hash,

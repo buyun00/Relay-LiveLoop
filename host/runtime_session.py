@@ -18,6 +18,7 @@ class RuntimeSessionConfig:
     shared_secret: bytes
     host_address: str
     port: int
+    resource_release_id: str | None = None
 
 
 def load_runtime_session(path: str | Path) -> RuntimeSessionConfig:
@@ -37,6 +38,14 @@ def load_runtime_session(path: str | Path) -> RuntimeSessionConfig:
         result = value.get(key)
         if not isinstance(result, str) or not result or "\n" in result or "\r" in result or len(result) > 256:
             raise ValueError(f"{key} must be a non-empty canonical text value.")
+        return result
+
+    def optional_text(key: str) -> str | None:
+        result = value.get(key)
+        if result is None:
+            return None
+        if not isinstance(result, str) or not result or "\n" in result or "\r" in result or "\0" in result or len(result) > 256:
+            raise ValueError(f"{key} must be a non-empty canonical text value when provided.")
         return result
 
     encoded = value.get("sharedSecretBase64")
@@ -65,5 +74,5 @@ def load_runtime_session(path: str | Path) -> RuntimeSessionConfig:
     return RuntimeSessionConfig(
         required_text("sessionId"), required_text("launchId"),
         required_text("runtimeRevision"), protocol_version, secret,
-        str(address), port,
+        str(address), port, optional_text("resourceReleaseId"),
     )
