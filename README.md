@@ -14,4 +14,6 @@ The authenticated Host lifecycle contract reports exact queued/running jobs and 
 
 The protocol keeps source changes, runtime application, automated checks, visual review, and clean-start verification as separate facts. A successful request never fills in evidence that was not actually collected.
 
+Local deployment scripts validate and reconstruct [server-owned Native compile profiles](contracts/deployment-native-profiles.md), including explicit external source roots, without transferring runtime sessions or Library caches.
+
 This branch is under active development. Runtime capabilities remain unavailable until a concrete provider reports current evidence for them.

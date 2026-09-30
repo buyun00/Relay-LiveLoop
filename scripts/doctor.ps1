@@ -54,6 +54,9 @@ function Get-DoctorProcessState {
 try {
     $configFull = Get-RelayExistingPath -Path $ConfigPath -Kind File
     $config = Get-RelayMachineConfig -ConfigPath $configFull
+    $nativeCompile = if ($null -ne $config.PSObject.Properties['nativeCompile']) {
+        Get-RelayNativeCompileInspection -Config $config -ConfigPath $configFull
+    } else { [ordered]@{ configured = $false; nativeRuntimeVerified = $false } }
 
     $installed = [ordered]@{
         toolRepository = (Test-DoctorPath -Path ([string]$config.toolRepoRoot) -Kind Directory) -and (Test-DoctorPath -Path (Join-Path ([string]$config.toolRepoRoot) 'relay_liveloop.py') -Kind File)
@@ -139,6 +142,7 @@ try {
             renderAfterRdpDisconnect = [string]$config.renderAfterRdpDisconnect
         }
         installed = $installed
+        nativeCompileConfiguration = $nativeCompile
         processes = [ordered]@{ host = $hostProcess; editor = $editorProcess }
         host = [ordered]@{
             reachable = [bool]$statusProbe.reachable

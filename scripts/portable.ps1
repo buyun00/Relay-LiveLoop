@@ -20,7 +20,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'lib\Deployment.Common.ps1')
 
 $script:PortableFormat = 'relay-liveloop-portable'
-$script:PortableVersion = 1
+$script:PortableVersion = 2
 $script:BlockedDirectoryNames = @(
     '.git', '.venv', 'venv', '__pycache__', '.pytest_cache',
     'Library', 'Temp', 'Obj', 'Logs', 'UserSettings',
@@ -347,9 +347,39 @@ function Invoke-PortableExport {
             Add-PortableSelection -Entries $entries -Destinations $destinations -Config $config -StageRoot $stageRoot -Category 'resource' -SelectedPath $path -AllowedRoles @('dataRoot') -SelectionIndex $index
             $index++
         }
+        $nativePortable = $null
+        if ($null -ne $config.PSObject.Properties['nativeCompile']) {
+            $planFile = Join-Path $stageRoot '.native-plan.json'
+            & ([string]$config.pythonExecutable) -B (Join-Path $PSScriptRoot 'native_compile_deployment.py') export --config $configFull --output $planFile | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Portable Native compiler profile export validation failed.' }
+            $plan = Read-RelayJsonFile -Path $planFile
+            $nativePortable = $plan.portable
+            foreach ($source in @($plan.sources)) {
+                $relative = [string]$source.relativePath
+                if (-not (Test-PortableManifestRelativePath -Path $relative) -or (Test-PortableBlockedRelativePath -RelativePath $relative)) {
+                    throw 'Portable trusted compiler source has an unsafe or blocked path.'
+                }
+                $archivePath = 'payload/nativeSource/' + $relative
+                $destinationKey = 'dataRoot:' + $relative
+                if (-not $destinations.Add($destinationKey)) { throw 'Portable compiler source repeats a destination.' }
+                $sourcePath = Get-RelayExistingPath -Path ([string]$source.sourcePath) -Kind File
+                if ((Get-RelayFileSha256 -Path $sourcePath) -ne [string]$source.sha256 -or (Get-Item -LiteralPath $sourcePath).Length -ne [long]$source.length) {
+                    throw 'Portable compiler source changed after profile validation.'
+                }
+                $target = Join-Path $stageRoot $archivePath
+                [IO.Directory]::CreateDirectory((Split-Path -Parent $target)) | Out-Null
+                Copy-Item -LiteralPath $sourcePath -Destination $target
+                if ((Get-RelayFileSha256 -Path $target) -ne [string]$source.sha256 -or (Get-RelayFileSha256 -Path $sourcePath) -ne [string]$source.sha256) {
+                    throw 'Portable compiler source changed during export.'
+                }
+                $entries.Add([ordered]@{ category = 'nativeSource'; rootRole = 'dataRoot'; relativePath = $relative;
+                    archivePath = $archivePath; length = [long]$source.length; sha256 = [string]$source.sha256 })
+            }
+            Remove-Item -LiteralPath $planFile -Force
+        }
         $manifest = [ordered]@{
             format = $script:PortableFormat
-            schemaVersion = $script:PortableVersion
+            schemaVersion = if ($null -ne $nativePortable) { 2 } else { 1 }
             bundleId = $bundleId
             createdAtUtc = [DateTime]::UtcNow.ToString('o')
             controlDefaults = [ordered]@{
@@ -362,6 +392,7 @@ function Invoke-PortableExport {
             exclusions = @('process identity', 'live objects', 'sessions', 'task execution state', 'token and license files', 'Library', 'virtual environments', 'caches')
             migrationValidation = 'NOT_RUN'
         }
+        if ($null -ne $nativePortable) { $manifest.nativeCompile = $nativePortable }
         Write-RelayJsonFile -Path (Join-Path $stageRoot 'manifest.json') -Value $manifest | Out-Null
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $temporaryArchive, [IO.Compression.CompressionLevel]::Optimal, $false)
@@ -420,8 +451,12 @@ function Invoke-PortableImport {
         Expand-PortableArchiveSafely -Archive $archiveFull -Destination $extractRoot
         $manifestPath = Get-RelayExistingPath -Path (Join-Path $extractRoot 'manifest.json') -Kind File
         $manifest = Read-RelayJsonFile -Path $manifestPath
-        if ($manifest.format -ne $script:PortableFormat -or [int]$manifest.schemaVersion -ne $script:PortableVersion) {
+        if ($manifest.format -ne $script:PortableFormat -or [int]$manifest.schemaVersion -notin @(1, 2)) {
             throw 'Portable manifest format or schemaVersion is unsupported.'
+        }
+        $nativePortableProperty = $manifest.PSObject.Properties['nativeCompile']
+        if (([int]$manifest.schemaVersion -eq 2) -ne ($null -ne $nativePortableProperty -and $null -ne $nativePortableProperty.Value)) {
+            throw 'Portable Native compile metadata requires schemaVersion 2.'
         }
         if ([string]::IsNullOrWhiteSpace([string]$manifest.bundleId)) {
             throw 'Portable manifest bundleId is missing.'
@@ -455,8 +490,11 @@ function Invoke-PortableImport {
             }
             $category = [string]$entry.category
             $role = [string]$entry.rootRole
-            if ($category -notin @('projectConfig', 'dependencyLock', 'baseline', 'resource')) {
+            if ($category -notin @('projectConfig', 'dependencyLock', 'baseline', 'resource', 'nativeSource')) {
                 throw 'Portable manifest entry category is invalid.'
+            }
+            if ($category -eq 'nativeSource' -and ([int]$manifest.schemaVersion -ne 2 -or $role -ne 'dataRoot' -or -not ([string]$entry.relativePath).StartsWith('compiler-sources/', [StringComparison]::Ordinal))) {
+                throw 'Portable compiler source must target the dedicated new dataRoot directory.'
             }
             if (-not $rootMap.ContainsKey($role)) {
                 throw 'Portable manifest entry rootRole is invalid.'
@@ -517,6 +555,20 @@ function Invoke-PortableImport {
         }
         if ($null -eq $projectConfigDestination) {
             throw 'Portable manifest contains no project configuration.'
+        }
+        if ($null -ne $nativePortableProperty) {
+            $expectedSources = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($profile in @($nativePortableProperty.Value.profiles)) {
+                if ($null -ne $profile.PSObject.Properties['trustedSourceRoots']) {
+                    foreach ($root in @($profile.trustedSourceRoots)) {
+                        foreach ($inputPath in @($root.inputs)) { [void]$expectedSources.Add(([string]$root.path + '/' + [string]$inputPath)) }
+                    }
+                }
+            }
+            $actualSources = @($entries | Where-Object { $_.category -eq 'nativeSource' })
+            if ($actualSources.Count -ne $expectedSources.Count -or @($actualSources | Where-Object { -not $expectedSources.Contains([string]$_.relativePath) }).Count -ne 0) {
+                throw 'Portable compiler source payload differs from the exact trusted root input set.'
+            }
         }
         foreach ($requiredCategory in @('dependencyLock', 'baseline', 'resource')) {
             if (@($entries | Where-Object { $_.category -eq $requiredCategory }).Count -eq 0) {
@@ -580,6 +632,20 @@ function Invoke-PortableImport {
             }
             classification = 'LOCAL_MACHINE_ONLY'
         }
+        $nativeValidation = $null
+        if ($null -ne $nativePortableProperty) {
+            $machineInput = Join-Path $extractRoot '.native-machine-input.json'
+            $portableInput = Join-Path $extractRoot '.native-portable-input.json'
+            $nativeResult = Join-Path $extractRoot '.native-reconstruction.json'
+            Write-RelayJsonFile -Path $machineInput -Value $machine | Out-Null
+            Write-RelayJsonFile -Path $portableInput -Value $nativePortableProperty.Value | Out-Null
+            $profileDestination = Join-Path $newData ('compiler-profiles/' + [string]$manifest.bundleId + '.json')
+            & $pythonFull -B (Join-Path $PSScriptRoot 'native_compile_deployment.py') reconstruct --config $machineInput --portable $portableInput --destination $profileDestination --output $nativeResult | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Portable Native profile reconstruction failed: exact local source/reference/baseline inputs are required; no Library or session is restored.' }
+            $reconstruction = Read-RelayJsonFile -Path $nativeResult
+            $machine.nativeCompile = $reconstruction.nativeCompile
+            $nativeValidation = $reconstruction.validation
+        }
         Assert-RelayLoopbackAddress -Address ([string]$machine.controlAddress)
         foreach ($port in @([int]$machine.controlPort, [int]$machine.runtimePort)) {
             if ($port -lt 1 -or $port -gt 65535) {
@@ -596,6 +662,8 @@ function Invoke-PortableImport {
             fileCount = $planned.Count
             rootsRediscovered = $true
             secondMachineValidation = 'NOT_RUN'
+            nativeCompileConfiguration = $nativeValidation
+            runtimeSessionImported = $false
         }
         Write-RelayJsonFile -Path (Join-Path $receiptRoot 'receipt.json') -Value $receipt | Out-Null
         return [ordered]@{
@@ -607,6 +675,7 @@ function Invoke-PortableImport {
             reusedMatchingFiles = @($planned | Where-Object { $_.action -eq 'reused_matching' }).Count
             rootsRediscovered = $true
             secondMachineValidated = $false
+            nativeCompileConfiguration = $nativeValidation
         }
     }
     finally {

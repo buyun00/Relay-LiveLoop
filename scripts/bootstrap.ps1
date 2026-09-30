@@ -10,6 +10,10 @@ param(
     [string[]]$SdkRoot = @(),
     [string]$TokenFile,
     [string]$ProjectConfigFile,
+    [string]$NativeCompileProfilesFile,
+    [string]$EditorJobRoot,
+    [string]$EditorArtifactRoot,
+    [string]$RuntimeSessionFile,
     [ValidateSet('127.0.0.1', 'localhost', '::1')][string]$ControlAddress = '127.0.0.1',
     [ValidateRange(1, 65535)][int]$ControlPort = 18760,
     [ValidateRange(1, 65535)][int]$RuntimePort = 18761
@@ -121,6 +125,33 @@ try {
             importedBundleId = $null
         }
         classification = 'LOCAL_MACHINE_ONLY'
+    }
+    $nativeValues = @($NativeCompileProfilesFile, $EditorJobRoot, $EditorArtifactRoot)
+    $nativeValueCount = @($nativeValues | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+    if ($nativeValueCount -notin @(0, 3)) {
+        throw 'Native compiler configuration requires all three profile/job/artifact paths.'
+    }
+    if ($nativeValueCount -eq 3) {
+        $config.nativeCompile = [ordered]@{
+            profilesFile = Get-RelayExistingPath -Path $NativeCompileProfilesFile -Kind File
+            editorJobRoot = Get-RelayFullPath -Path $EditorJobRoot
+            editorArtifactRoot = Get-RelayFullPath -Path $EditorArtifactRoot
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeSessionFile)) {
+        $config.runtimeSessionFile = Get-RelayExistingPath -Path $RuntimeSessionFile -Kind File
+    }
+    Assert-RelayNativeCompileConfig -Config ([pscustomobject]$config)
+    # Validate before publishing the machine configuration; the temporary file is task owned.
+    $validationFile = Join-Path $stateRoot ('profile-check-' + [Guid]::NewGuid().ToString('N') + '.json')
+    try {
+        Write-RelayJsonFile -Path $validationFile -Value $config | Out-Null
+        if ($nativeValueCount -eq 3) {
+            Get-RelayNativeCompileInspection -Config ([pscustomobject]$config) -ConfigPath $validationFile | Out-Null
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $validationFile) { Remove-Item -LiteralPath $validationFile -Force }
     }
     Write-RelayJsonFile -Path $configFull -Value $config | Out-Null
 

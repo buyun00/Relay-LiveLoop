@@ -243,6 +243,57 @@ function Assert-RelayMachineConfigPaths {
             throw 'Configured artifact root escapes dataRoot.'
         }
     }
+    Assert-RelayNativeCompileConfig -Config $Config
+}
+
+function Assert-RelayNativeCompileConfig {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $native = $Config.PSObject.Properties['nativeCompile']
+    $session = $Config.PSObject.Properties['runtimeSessionFile']
+    if ($null -ne $session -and -not [string]::IsNullOrWhiteSpace([string]$session.Value)) {
+        Get-RelayExistingPath -Path ([string]$session.Value) -Kind File | Out-Null
+        Assert-RelayPathOutsideGitTree -Path ([string]$session.Value) -Label 'Runtime session handoff'
+        if ($null -eq $native -or $null -eq $native.Value) {
+            throw 'runtimeSessionFile requires an explicit nativeCompile configuration.'
+        }
+    }
+    if ($null -eq $native -or $null -eq $native.Value) { return }
+    $value = if ($native.Value -is [Collections.IDictionary]) { [pscustomobject]$native.Value } else { $native.Value }
+    $keys = @($value.PSObject.Properties.Name | Sort-Object)
+    if (($keys -join ',') -ne 'editorArtifactRoot,editorJobRoot,profilesFile') {
+        throw 'nativeCompile requires exact profilesFile/editorJobRoot/editorArtifactRoot fields.'
+    }
+    Get-RelayExistingPath -Path ([string]$value.profilesFile) -Kind File | Out-Null
+    foreach ($name in @('profilesFile', 'editorJobRoot', 'editorArtifactRoot')) {
+        $path = Get-RelayFullPath -Path ([string](Get-RelayRequiredProperty -Object $value -Name $name))
+        Assert-RelayPathOutsideRoots -Path $path -Roots @([string]$Config.toolRepoRoot, [string]$Config.gameRepoRoot) -Label "Native $name"
+        Assert-RelayPathOutsideGitTree -Path $path -Label "Native $name"
+    }
+}
+
+function Get-RelayNativeCompileInspection {
+    param([Parameter(Mandatory = $true)]$Config, [Parameter(Mandatory = $true)][string]$ConfigPath)
+
+    Assert-RelayNativeCompileConfig -Config $Config
+    $helper = Join-Path ([string]$Config.toolRepoRoot) 'scripts\native_compile_deployment.py'
+    $output = @(& ([string]$Config.pythonExecutable) -B $helper inspect --config $ConfigPath)
+    if ($LASTEXITCODE -ne 0) { throw 'Server-owned Native compiler profile validation failed.' }
+    return (($output -join [Environment]::NewLine) | ConvertFrom-Json)
+}
+
+function Get-RelayNativeCompileArguments {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    Assert-RelayNativeCompileConfig -Config $Config
+    $session = $Config.PSObject.Properties['runtimeSessionFile']
+    if ($null -eq $session -or [string]::IsNullOrWhiteSpace([string]$session.Value)) { return @() }
+    $native = $Config.nativeCompile
+    return @('--runtime-session-file', (Get-RelayFullPath -Path ([string]$session.Value)),
+             '--native-compile-profiles', (Get-RelayFullPath -Path ([string]$native.profilesFile)),
+             '--editor-job-root', (Get-RelayFullPath -Path ([string]$native.editorJobRoot)),
+             '--editor-artifact-root', (Get-RelayFullPath -Path ([string]$native.editorArtifactRoot)),
+             '--artifact-root', (Get-RelayFullPath -Path ([string]$native.editorArtifactRoot)))
 }
 
 function Get-RelayProjectVersion {
