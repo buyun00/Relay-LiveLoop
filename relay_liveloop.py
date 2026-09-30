@@ -236,6 +236,18 @@ def _serve(args: argparse.Namespace) -> int:
                 runtime_transport.close()
             ledger.close()
             raise
+    preparation_factory = getattr(args, "preparation_provider_factory", None)
+    if preparation_factory is not None:
+        from types import SimpleNamespace
+        try:
+            preparation_provider = preparation_factory(SimpleNamespace(ledger=ledger, artifacts=artifacts,
+                source_provider=source_provider, preparation_provider=preparation_provider, runtime_provider=runtime_provider,
+                editor_transport=editor_transport, runtime_transport=runtime_transport))
+        except BaseException:
+            if runtime_transport is not None:
+                runtime_transport.close()
+            ledger.close()
+            raise
     service = build_command_service(
         ledger,
         artifacts,

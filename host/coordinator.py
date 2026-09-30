@@ -217,12 +217,12 @@ class UpdateCoordinator:
             self._bind_job_plan(job_id, plan["planId"])
             self._retain_apply_evidence(job_id, plan)
             if plan["approvalRequired"] and not plan["approvalRef"]:
-                self.ledger.update_job(
+                self._update_job_progress(
                     job_id,
                     state="completed",
                     stage="approval_required",
                     runtime_changed=False,
-                    result={"status": "approval_required", "plan": plan},
+                    updates={"status": "approval_required", "plan": plan},
                 )
                 return
             self._apply_plan(job_id, command, plan)
@@ -369,6 +369,9 @@ class UpdateCoordinator:
             details["targetGenerationsAfter"] = normalized["targetGenerationsAfter"]
         if normalized.get("preparationEvidence") is not None:
             details["preparationEvidence"] = normalized["preparationEvidence"]
+        if normalized.get("resourceBuildEvidence") is not None:
+            self._verify_source_resource_build(task, normalized["resourceBuildEvidence"], normalized)
+            details["resourceBuildEvidence"] = normalized["resourceBuildEvidence"]
         if normalized.get("compositeBinding") is not None:
             details["compositeBinding"] = normalized["compositeBinding"]
         plan_id = self._prepare_plan_id(job_id)
@@ -574,7 +577,7 @@ class UpdateCoordinator:
         if expected_profile_digest is not None:
             required.add("profileDigest")
         value_keys = frozenset(value)
-        optional = {"targetGenerationsAfter", "preparationEvidence", "compositeBinding"}
+        optional = {"targetGenerationsAfter", "preparationEvidence", "compositeBinding", "resourceBuildEvidence"}
         if not required.issubset(value_keys) or not value_keys.issubset(required | optional):
             raise CommandError("CONTRACT_MISMATCH", "Preparation result fields do not match the provider contract.", stage="prepare")
         for key in ("inputSnapshot", "expectedRuntimeRevision"):
@@ -592,10 +595,10 @@ class UpdateCoordinator:
             raise CommandError("STALE_TARGET", "Prepared runtime revision does not match the observed runtime.", stage="prepare")
         if value["route"] not in ROUTES or value["route"] == "BLOCKED":
             raise CommandError("CAPABILITY_UNAVAILABLE", "Preparation did not select an executable verified route.", stage="prepare")
-        if value["expectedRuntimeRevisionAfter"] is None and value["route"] not in {"MODULE_RELOAD", "MODULE_AND_ASSET_RELOAD"}:
-            raise CommandError("CONTRACT_MISMATCH", "Only module reload routes may use a Player-assigned after revision.", stage="prepare")
+        if value["expectedRuntimeRevisionAfter"] is None and value["route"] not in {"MODULE_RELOAD", "MODULE_AND_ASSET_RELOAD", "VIEW_RELOAD"}:
+            raise CommandError("CONTRACT_MISMATCH", "Only module or page reload routes may use a Player-assigned after revision.", stage="prepare")
         if value["expectedRuntimeRevisionAfter"] is None and "targetGenerationsAfter" not in value:
-            raise CommandError("CONTRACT_MISMATCH", "Player-assigned module revision requires frozen targetGenerationsAfter.", stage="prepare")
+            raise CommandError("CONTRACT_MISMATCH", "Player-assigned reload revision requires frozen targetGenerationsAfter.", stage="prepare")
         if value["route"] == "MODULE_AND_ASSET_RELOAD":
             if not isinstance(value.get("compositeBinding"), dict) or not getattr(
                 self.preparation_provider, "is_composite_preparation_provider", False
@@ -802,6 +805,14 @@ class UpdateCoordinator:
                 details={"missingKinds": sorted(missing)},
             )
 
+    def _verify_source_resource_build(self, task: dict[str, Any], metadata: Any, plan: dict[str, Any]) -> None:
+        if not isinstance(metadata, dict) or set(metadata) != {"artifactId", "kind", "sha256", "mediaType", "size"} or metadata.get("kind") != "source_resource_build_receipt":
+            raise CommandError("CONTRACT_MISMATCH", "Resource build evidence must reference one registered source-resource receipt.", stage="source_resource_build", runtime_changed=False, recoverable=False)
+        verifier = getattr(self.preparation_provider, "verify_resource_build_evidence", None)
+        if not callable(verifier):
+            raise capability_unavailable("source_resource_build", "The current preparation provider cannot verify saved-source build evidence.")
+        verifier(task, metadata, plan)
+
     def _apply_plan(self, job_id: str, command: dict[str, Any], plan: dict[str, Any]) -> None:
         self._retain_apply_evidence(job_id, plan)
         provider = self.runtime_provider
@@ -845,6 +856,9 @@ class UpdateCoordinator:
                 expected_runtime_state=before,
                 job_id=None,
             )
+        source_build = plan.get("details", {}).get("resourceBuildEvidence")
+        if source_build is not None:
+            self._verify_source_resource_build(task, source_build, plan)
         current_job = self.ledger.get_job(job_id)
         progress_updates: dict[str, Any] = {"runtimeBefore": dict(before)}
         preparation_evidence = plan.get("details", {}).get("preparationEvidence")
@@ -1147,6 +1161,9 @@ class UpdateCoordinator:
         """Keep preparation caveats through preflight failure and restart recovery."""
         job = self.ledger.get_job(job_id)
         result = dict(job.get("result") or {})
+        source_build = plan.get("details", {}).get("resourceBuildEvidence")
+        if isinstance(source_build, dict):
+            result["resourceBuildEvidence"] = source_build
         evidence = plan.get("details", {}).get("preparationEvidence")
         if isinstance(evidence, dict) and evidence.get("schema") == "relay.liveloop.composite-preparation-evidence":
             evidence = evidence.get("code")

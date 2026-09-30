@@ -499,6 +499,14 @@ class Ledger:
             "updatedAt": row["updated_at"],
         }
 
+    def latest_task_job(self, task_id: str, operation: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM jobs WHERE task_id = ? AND operation = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (task_id, operation),
+            ).fetchone()
+        return self._job_from_row(row) if row is not None else None
+
     def list_active_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(

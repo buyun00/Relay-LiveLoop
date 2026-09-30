@@ -53,7 +53,10 @@ class EditorSourceProvider:
             self._fail("WRONG_SESSION", "Source command session differs from the task.")
         if operation == "source.locate":
             binding = self._binding(task, command["arguments"]["target"], context)
-            return {"status": "completed", "runtimeChanged": False, "result": {"source": binding}, "facts": {}}
+            runtime_evidence = self.runtime_source_evidence(task, binding)
+            source = dict(binding, **(runtime_evidence or {}))
+            facts = {"runtimeMatched": False} if runtime_evidence and runtime_evidence["runtimeMatched"] is False else {}
+            return {"status": "completed", "runtimeChanged": False, "result": {"source": source}, "facts": facts}
         if operation != "source.edit":
             self._fail("INVALID_REQUEST", "Source provider operation is unsupported.")
         edits = command["arguments"]["edits"]
@@ -80,7 +83,9 @@ class EditorSourceProvider:
         snapshot = "sha256:" + hashlib.sha256(_json(edit_context).encode("utf-8")).hexdigest()
         job = self.ledger.create_job({"requestId": command["requestId"], "operation": operation,
                                      "taskId": task["taskId"], "state": "queued", "stage": "source_queued", "runtimeChanged": False,
-                                     "result": {"binding": binding, "payload": payload, "inputSnapshot": snapshot,
+                                     "result": {"taskScope": {key: task[key] for key in ("sessionId", "target", "reference", "goal", "allowedImpact", "acceptance")},
+                                                "runtimeSourceEvidence": self.runtime_source_evidence(task, binding),
+                                                "binding": binding, "payload": payload, "inputSnapshot": snapshot,
                                                 "sourceSaved": None, "sourceChanged": None, "runtimeApplied": False}})
         envelope = EditorJobEnvelope(job["jobId"], "source.edit", snapshot, self.provider_id,
                                      str(self.transport.artifact_root), datetime.now(timezone.utc).isoformat(),
@@ -162,6 +167,20 @@ class EditorSourceProvider:
         for job in self.ledger.list_active_jobs():
             if job["operation"] == "source.edit":
                 self.refresh_job(job["jobId"])
+
+    def runtime_source_evidence(self, task: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any] | None:
+        reader = getattr(self.resolver, "runtime_evidence", None)
+        if not callable(reader):
+            return None
+        value = reader(task, binding)
+        fields = {"runtimeSourceHash", "persistedSourceHash", "runtimeMatched", "knownTaskSave", "sourceSaveJobId"}
+        if not isinstance(value, dict) or set(value) != fields or any(not isinstance(value[k], str) or not SHA256_RE.fullmatch(value[k]) for k in ("runtimeSourceHash", "persistedSourceHash")):
+            self._fail("CONTRACT_MISMATCH", "Runtime source evidence fields or hashes are invalid.")
+        if value["persistedSourceHash"] != binding["sourceHash"] or type(value["runtimeMatched"]) is not bool or type(value["knownTaskSave"]) is not bool or value["runtimeMatched"] != (value["runtimeSourceHash"] == value["persistedSourceHash"]):
+            self._fail("INPUT_CHANGED", "Loaded and persisted source facts are contradictory.")
+        if not value["runtimeMatched"] and (not value["knownTaskSave"] or not isinstance(value["sourceSaveJobId"], str) or not value["sourceSaveJobId"]):
+            self._fail("INPUT_CHANGED", "Source drift has no completed known task save proof.")
+        return value
 
     def _binding(self, task: dict[str, Any], source_id: str, context: dict[str, Any]) -> dict[str, Any]:
         binding = self.resolver.resolve(task, source_id, context)
