@@ -99,3 +99,15 @@ class ProviderRegistry:
         if not isinstance(result, dict):
             raise CommandError("CONTRACT_MISMATCH", f"Provider {capability} returned a non-object result.", stage=capability)
         return result
+
+    def refresh_job(self, job_id: str) -> None:
+        for _, provider, _ in tuple(self._providers.values()):
+            refresh = getattr(provider, "refresh_job", None)
+            if callable(refresh):
+                refresh(job_id)
+
+    def recover_pending(self) -> None:
+        for _, provider, _ in tuple(self._providers.values()):
+            recover = getattr(provider, "recover_pending", None)
+            if callable(recover):
+                recover()

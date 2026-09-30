@@ -44,6 +44,8 @@ class EvidenceStore:
         operation: str,
         facts: dict[str, bool | None],
         evidence_by_fact: dict[str, dict[str, Any]],
+        *,
+        invalidate_facts: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         self.ledger.get_task(task_id)
         known = {name: value for name, value in facts.items() if value is not None}
@@ -51,6 +53,8 @@ class EvidenceStore:
             return self.ledger.get_task(task_id)
         if not known.keys() <= FACT_COLUMNS.keys():
             raise ValueError("Unknown task fact.")
+        if not set(invalidate_facts) <= FACT_COLUMNS.keys() or set(invalidate_facts) & known.keys():
+            raise ValueError("Invalidated facts must be supported and distinct from new known facts.")
         now = utc_now()
         assignments = []
         values: list[Any] = []
@@ -76,6 +80,9 @@ class EvidenceStore:
                 )
                 assignments.append(f"{FACT_COLUMNS[fact_name]} = ?")
                 values.append(int(outcome))
+            for fact_name in invalidate_facts:
+                assignments.append(f"{FACT_COLUMNS[fact_name]} = ?")
+                values.append(None)
             values.append(task_id)
             changed = connection.execute(
                 f"UPDATE tasks SET {', '.join(assignments)} WHERE task_id = ?",

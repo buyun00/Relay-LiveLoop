@@ -33,6 +33,8 @@ namespace RelayLiveLoop
         public string propertyPath;
         public string expectedValueJson;
         public string replacementValueJson;
+        // Optional opaque context for an input-bound, transactional source provider.
+        public string providerContextJson;
     }
 
     public interface ICompileJobProvider

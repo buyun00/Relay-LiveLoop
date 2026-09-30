@@ -335,8 +335,11 @@ class ProviderResultPolicy:
         artifacts = self._artifacts(value.get("artifacts", []), task_id)
         timings = self._timings(value.get("timingsMs", {}))
         evidence = self._validate_fact_evidence(task_id, facts, result)
-        if task_id is not None:
-            task = self.evidence.apply_task_facts(task_id, operation, facts, evidence)
+        if task_id is not None and status not in {"accepted", "approval_required"}:
+            invalidate = ("runtimeMatched", "checksPassed", "visualReviewed", "freshVerified") if operation == "source.edit" and facts.get("sourceSaved") is True else ()
+            if invalidate and any(facts.get(key) is not None for key in invalidate):
+                self._mismatch("Source saving cannot assert runtime application or acceptance facts.")
+            task = self.evidence.apply_task_facts(task_id, operation, facts, evidence, invalidate_facts=invalidate)
             facts = task["facts"]
         return {
             "status": status,

@@ -410,6 +410,10 @@ class SyntheticPreparationProvider:
 class SyntheticRuntimeProvider:
     provider_id = "synthetic-runtime"
 
+    def supports_route(self, route: str) -> bool:
+        # Explicit synthetic capability used by the v006 preparation gate.
+        return route == "HOTFIX"
+
     def __init__(self) -> None:
         self.state = {
             "sessionId": "session_apply_evidence",

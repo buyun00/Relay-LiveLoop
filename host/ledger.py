@@ -557,7 +557,7 @@ class Ledger:
         job = self.get_job(job_id)
         if job["state"] in {"completed", "failed", "state_unknown", "cancelled"}:
             return {"job": job, "cancelAccepted": False, "reason": "terminal"}
-        if job["stage"] in {"runtime_apply", "runtime_reconcile"}:
+        if job["stage"] in {"runtime_apply", "runtime_reconcile", "source_dispatched"}:
             return {"job": job, "cancelAccepted": False, "reason": "non_interruptible_stage"}
         with self.transaction() as connection:
             connection.execute(

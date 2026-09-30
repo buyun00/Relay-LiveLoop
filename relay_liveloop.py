@@ -113,9 +113,16 @@ def build_command_service(
     preparation_provider=None,
     runtime_provider=None,
     player_process_provider=None,
+    source_provider=None,
 ) -> CommandService:
     """Construct the shared service and attach its single optional coordinator owner."""
     provider_registry = providers
+    if source_provider is not None:
+        if provider_registry is None:
+            from host.providers import ProviderRegistry
+
+            provider_registry = ProviderRegistry()
+        provider_registry.register("source", source_provider.provider_id, source_provider, verified=source_provider.is_verified)
     if player_process_provider is not None:
         if provider_registry is None:
             from host.providers import ProviderRegistry
@@ -227,6 +234,7 @@ def _serve(args: argparse.Namespace) -> int:
     )
     server = create_http_server(service, token, args.host, args.port)
     try:
+        service.providers.recover_pending()
         if service.coordinator is not None:
             service.coordinator.recover_pending()
         server.serve_forever(poll_interval=0.25)

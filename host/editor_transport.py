@@ -217,6 +217,15 @@ class EditorJobTransport:
             return None
         return self._read_and_validate_result(path, ticket)
 
+    def has_dispatch_evidence(self, job_id: str) -> bool:
+        """A durable dispatch may already have saved source before Host progress was written."""
+        if not isinstance(job_id, str) or not EDITOR_ID_RE.fullmatch(job_id):
+            self._contract_mismatch("Editor job id is invalid.")
+        return any(path.exists() for path in (
+            self._request_path(self._incoming, job_id), self._request_path(self._processing, job_id),
+            self._result_path(job_id), self._submission_path(job_id),
+        ))
+
     def wait(
         self,
         ticket: EditorJobTicket,

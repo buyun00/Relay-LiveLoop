@@ -1175,7 +1175,7 @@ class UpdateCoordinator:
         """Recover durable jobs without repeating any possibly-dispatched runtime apply."""
         with self.ledger.transaction() as connection:
             rows = connection.execute(
-                "SELECT job_id FROM jobs WHERE state IN ('queued', 'running') ORDER BY created_at"
+                "SELECT job_id FROM jobs WHERE state IN ('queued', 'running') AND operation IN ('prepare', 'iterate') ORDER BY created_at"
             ).fetchall()
         recovered = []
         for row in rows:

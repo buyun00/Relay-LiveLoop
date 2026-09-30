@@ -250,6 +250,7 @@ class CommandService:
             task = self.ledger.get_task(task_id)
             return self._response(request_id, status="completed", result={"approval": approval}, plan_id=arguments["planId"], facts=task["facts"])
         if operation == "job.status":
+            self.providers.refresh_job(arguments["jobId"])
             job = self.ledger.get_job(arguments["jobId"])
             return self._response(
                 request_id,
