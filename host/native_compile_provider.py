@@ -308,7 +308,7 @@ class NativeSourcePreparationProvider:
     def _make_envelope(self, job_id: str, task: dict[str, Any], profile: NativeCompileProfile, binding: dict[str, Any]) -> EditorJobEnvelope:
         context = {
             "schema": "relay.liveloop.native-compile-context",
-            "version": 3,
+            "version": 4 if profile.profile_version == 3 else 3,
             "profileId": profile.profile_id,
             "profileDigest": binding["profileDigest"],
             "projectRoot": profile.project_root.as_posix(),
@@ -329,6 +329,8 @@ class NativeSourcePreparationProvider:
             "entryAssemblyName": profile.entry_assembly_name,
             "assemblies": profile.context_assemblies(),
         }
+        if profile.profile_version == 3:
+            context["trustedSourceRoots"] = profile.context_source_roots()
         payload = {
             "buildTarget": profile.build_target,
             "configuration": profile.configuration,
@@ -383,7 +385,7 @@ class NativeSourcePreparationProvider:
             raise CommandError("CONTRACT_MISMATCH", "Durable Editor payload cannot be reconciled.", stage="prepare_reconcile", runtime_changed=False, recoverable=False) from exc
         expected_context = {
             "schema": "relay.liveloop.native-compile-context",
-            "version": 3,
+            "version": 4 if profile.profile_version == 3 else 3,
             "profileId": profile.profile_id,
             "profileDigest": binding["profileDigest"],
             "projectRoot": profile.project_root.as_posix(),
@@ -404,6 +406,8 @@ class NativeSourcePreparationProvider:
             "entryAssemblyName": profile.entry_assembly_name,
             "assemblies": profile.context_assemblies(),
         }
+        if profile.profile_version == 3:
+            expected_context["trustedSourceRoots"] = profile.context_source_roots()
         expected_payload = {
             "buildTarget": profile.build_target,
             "configuration": profile.configuration,

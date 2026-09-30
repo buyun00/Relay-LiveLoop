@@ -12,6 +12,10 @@ from typing import Any
 
 from .errors import CommandError, capability_unavailable
 from .validation import ID_RE, SHA256_RE
+from .native_compile_roots import (
+    TrustedCompileSourceRoot, _canonical_absolute, _canonical_file, _canonical_relative,
+    parse_trusted_source_roots, source_roots_contract,
+)
 
 
 PROFILE_SCHEMA = "relay.liveloop.native-compile-profiles"
@@ -97,6 +101,11 @@ class NativeCompileProfile:
     entry_assembly_name: str
     assemblies: tuple[NativeCompileAssemblyProfile, ...]
     timeout_seconds: float
+    trusted_source_roots: tuple[TrustedCompileSourceRoot, ...] = ()
+    profile_version: int = 2
+
+    def context_source_roots(self) -> list[dict[str, Any]]:
+        return source_roots_contract(self.trusted_source_roots)
 
     def context_assemblies(self) -> list[dict[str, Any]]:
         return [
@@ -140,21 +149,23 @@ class NativeCompileProfileRegistry:
     @classmethod
     def from_value(cls, value: Any) -> NativeCompileProfileRegistry:
         document = _object(value, {"schema", "version", "profiles"}, "profile document")
-        if document["schema"] != PROFILE_SCHEMA or type(document["version"]) is not int or document["version"] != 2:
+        if document["schema"] != PROFILE_SCHEMA or type(document["version"]) is not int or document["version"] not in {2, 3}:
             raise ValueError("Native compile profile schema/version is unsupported")
         raw_profiles = document["profiles"]
         if not isinstance(raw_profiles, list) or not 1 <= len(raw_profiles) <= 256:
             raise ValueError("profiles must contain 1..256 entries")
-        return cls([cls._parse_profile(raw, index) for index, raw in enumerate(raw_profiles)])
+        return cls([cls._parse_profile(raw, index, document["version"]) for index, raw in enumerate(raw_profiles)])
 
     @staticmethod
-    def _parse_profile(raw: Any, index: int) -> NativeCompileProfile:
+    def _parse_profile(raw: Any, index: int, version: int = 2) -> NativeCompileProfile:
         keys = {
             "profileId", "target", "projectRoot", "unityRoot", "unityVersion", "buildTarget", "buildTargetGroup",
             "configuration", "developmentBuild", "subtarget", "extraScriptingDefines", "defines",
             "references", "sourceInputs", "moduleId", "dependencyClosure", "initialModuleGeneration",
             "entryAssemblyName", "assemblies", "timeoutSeconds",
         }
+        if version == 3:
+            keys.add("trustedSourceRoots")
         value = _object(raw, keys, f"profiles[{index}]")
         profile_id = _text(value["profileId"], "profileId", 128)
         target = _text(value["target"], "target", 2000)
@@ -170,6 +181,14 @@ class NativeCompileProfileRegistry:
             raise ValueError("unityRoot must be an existing directory")
         if root == unity_root or root in unity_root.parents or unity_root in root.parents:
             raise ValueError("projectRoot and unityRoot must be distinct, non-nested roots")
+        trusted_roots: tuple[TrustedCompileSourceRoot, ...] = ()
+        if version == 3:
+            for raw_root, resolved_root in ((root_text, root), (unity_root_text, unity_root)):
+                canonical = _canonical_absolute(raw_root)
+                _reject_reparse_path(Path(canonical.anchor), canonical)
+                if canonical.as_posix() != resolved_root.as_posix():
+                    raise ValueError("Profile roots cannot use canonical path aliases")
+            trusted_roots = parse_trusted_source_roots(value["trustedSourceRoots"], (root, unity_root), _reject_reparse_path)
         unity_version = _text(value["unityVersion"], "unityVersion", 128)
         build_target = _text(value["buildTarget"], "buildTarget", 128)
         build_target_group = _text(value["buildTargetGroup"], "buildTargetGroup", 128)
@@ -190,6 +209,9 @@ class NativeCompileProfileRegistry:
         source_inputs = _string_list(value["sourceInputs"], "sourceInputs", maximum=4096)
         if not source_inputs:
             raise ValueError("sourceInputs must not be empty")
+        if version == 3:
+            for source in source_inputs:
+                _canonical_file(root, source, _reject_reparse_path, external=False)
         module_id = _text(value["moduleId"], "moduleId", 128)
         if not ID_RE.fullmatch(module_id):
             raise ValueError("moduleId is not a safe identifier")
@@ -217,6 +239,8 @@ class NativeCompileProfileRegistry:
             assembly_module = _text(assembly["moduleId"], "assembly.moduleId", 128)
             dependencies = _string_list(assembly["dependencies"], "assembly.dependencies", maximum=128, item_maximum=128)
             baseline_relative = _text(assembly["baselinePath"], "assembly.baselinePath", 2048)
+            if version == 3:
+                baseline_relative = _canonical_relative(baseline_relative)
             baseline_hash = assembly["baselineSha256"]
             if not ASSEMBLY_NAME_RE.fullmatch(name) or assembly_module not in dependency_closure:
                 raise ValueError("Assembly name/moduleId does not belong to the profile closure")
@@ -276,6 +300,8 @@ class NativeCompileProfileRegistry:
             entry_assembly_name=entry_name,
             assemblies=tuple(assemblies),
             timeout_seconds=float(timeout),
+            trusted_source_roots=trusted_roots,
+            profile_version=version,
         )
 
     def for_task(self, task: dict[str, Any]) -> NativeCompileProfile:
@@ -397,6 +423,11 @@ def native_compile_profile_digest(profile: NativeCompileProfile) -> str:
         ],
         "timeoutSeconds": profile.timeout_seconds,
     }
+    if profile.profile_version == 3:
+        document.update(schema="relay.liveloop.native-compile-profile/3", version=3,
+                        trustedSourceRoots=profile.context_source_roots())
+    elif profile.profile_version != 2 or profile.trusted_source_roots:
+        raise ValueError("Native compile profile version/root configuration is inconsistent")
     canonical = json.dumps(
         document, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")

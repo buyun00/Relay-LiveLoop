@@ -34,7 +34,7 @@ These response-field expectations are cross-end contract dependencies, not evide
 
 ## Compiler-input coverage and evidence
 
-The Native source-compile profile digest binds the normalized server-owned profile, including Unity installation/version, build target/group, development flag, subtarget, scripting defines, project/build settings, declarations, module/dependency closure, assembly/baseline pins, and timeout. Editor compile-context and analysis are version 3. The receipt schema remains `relay.liveloop.native-compile-input-receipt` version 1.
+The Native source-compile profile digest binds the normalized server-owned profile, including Unity installation/version, build target/group, development flag, subtarget, scripting defines, project/build settings, declarations, module/dependency closure, assembly/baseline pins, and timeout. Server profile document version 2 retains compile context version 3 and input receipt version 1, including its unchanged `/2` profile digest and exact field sets. An explicitly configured version 3 profile uses context version 4, receipt version 2, and a `/3` profile digest. Compile analysis remains version 3 in both cases.
 
 The Editor receipt enumerates observed assembly sources/references and compiler-option paths, project/package/assembly configuration, HybridCLR package files, pinned Unity/Mono/compiler files, bundled Roslyn and BuildPipeline files, output hashes, compile settings/result, and before/after digests for the listed inputs. Host independently revalidates that recorded inventory and its required configuration/toolchain files at receipt sealing, recovery, plan finalization, and immediately before apply. This verifies the enumerated set; it is not proof that the set contains every file actually read by the compiler.
 
@@ -47,6 +47,30 @@ Every valid receipt must carry all three limitation markers:
 Preparation evidence labels coverage `ENUMERATED_ONLY_NOT_PROVEN_COMPLETE` and preserves the exact receipt limitation list. Host compares that list with the sealed receipt during plan validation/recovery and revalidation before apply. The same label, exact limitations, and receipt artifact ID/hash are copied into the terminal apply job result. A missing marker or changed evidence fails closed. No compiler PID requirement is added, and no arbitrary argument/analyzer transitive-read closure is claimed.
 
 `inputSnapshot` is a separate digest of configured build target/configuration/defines/references and declared source-input paths/bytes. Neither it nor the profile digest proves that declarations cover all compiler-consumed inputs.
+
+## Explicit server-owned external compiler inputs
+
+The existing server profile registry can opt into profile document version 3. Each profile then requires one additional field, `trustedSourceRoots`. A root has exactly `rootId`, `path`, and `inputs`: a safe stable identity, its exact canonical existing absolute directory, and a non-empty closed list of canonical relative files. This is server configuration loaded by the existing normal provider/factory. HTTP, CLI and MCP command arguments cannot install roots or expand that file list.
+
+```json
+{
+  "trustedSourceRoots": [
+    {
+      "rootId": "shared-sources",
+      "path": "C:/SyntheticSources",
+      "inputs": ["Runtime/Core/Extension.cs", "Runtime/Core/Support.cs"]
+    }
+  ]
+}
+```
+
+This example shows the additional field only, not a complete profile. Root IDs match `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`, are unique ignoring case, and cannot be `project` or `unity`. There are 1..32 roots and at most 100000 configured external files. Volume roots, overlapping/nested roots, aliases, reparse-backed roots/files, external hard-link aliases, missing/non-regular files, and duplicate relative identities are refused. Membership uses path segments and verified canonical paths, never a string-prefix directory whitelist. Roots are sorted by rootId using .NET Ordinal order; each inputs list is likewise sorted. Context version 4 and receipt version 2 must echo this normalized array exactly. A legacy context/receipt must omit the additional field entirely, including null or empty values.
+
+The `/3` digest binds root identities, canonical directories and the closed input lists in addition to every prior profile field. A receipt input still has exactly `scope`, `path`, `roles`, `sha256`, and `size`. An external scope is `source:` followed by the configured rootId; its path is relative to that root and must match the configured file list exactly. All configured external inputs must be present. The existing project/unity scopes remain unchanged. Absolute assembly graph and compiler-option paths retain their real canonical paths, with recorded roles derived from that actual graph. Receipt version 2 refuses missing or additional input paths/roles against the independently reconstructed graph, project-configuration and Unity-toolchain inventories, including an otherwise hash-valid unconfigured external file.
+
+The length-prefixed input-set digest algorithm remains unchanged: the new scope identity participates in the same before/after SHA256. Every actual file SHA256/size is re-read after compile and during Host receipt validation, recovery and before apply. Neither a configured root nor a matching profile digest waives byte drift, output closure, task/job/session/context identity or version checks. An old receipt cannot satisfy a new-root profile by omitting its roots. Profile version 2 remains a strict two-root mode and rejects the new configuration field.
+
+The declared project `sourceInputs` and their `inputSnapshot` keep their existing separate semantics. Explicit external-input handling does not claim complete arbitrary compiler argument/analyzer/source-generator reads or a proven compiler process identity. The same enumerated-only coverage classification and required limitations remain mandatory.
 
 ## Lost Editor result and no-replay boundary
 

@@ -16,6 +16,7 @@ from .native_compile_profile import (
     native_compile_profile_digest,
 )
 from .validation import SHA256_RE
+from .native_compile_roots import absolute_input_key, root_mapping, verified_input_path
 
 
 RECEIPT_SCHEMA = "relay.liveloop.native-compile-input-receipt"
@@ -255,6 +256,8 @@ def native_compile_input_set_digest(inputs: list[dict[str, Any]]) -> str:
 
 
 def _absolute_receipt_key(profile: NativeCompileProfile, raw: Any) -> tuple[str, str]:
+    if profile.profile_version == 3:
+        return absolute_input_key(profile, raw, _reject_reparse_path)
     absolute = _bounded_text(raw, "compiler input path", 8192)
     candidate = Path(absolute)
     if not candidate.is_absolute():
@@ -274,11 +277,14 @@ def _require_recorded_role(
     inputs: dict[tuple[str, str], dict[str, Any]],
     absolute_path: Any,
     role: str,
+    expected_roles: dict[tuple[str, str], set[str]] | None = None,
 ) -> None:
     key = _absolute_receipt_key(profile, absolute_path)
     record = inputs.get(key)
     if record is None or role not in record["roles"]:
         raise ValueError("Compiler graph input is absent from the hashed receipt closure")
+    if expected_roles is not None:
+        expected_roles.setdefault(key, set()).add(role)
 
 
 def _validate_compiler_options(value: Any, label: str) -> dict[str, Any]:
@@ -327,10 +333,15 @@ def validate_native_compile_input_receipt(
             "assemblies", "compileResultAssemblies", "inputs", "inputSetSha256Before", "inputSetSha256After", "inputSetMatches",
             "outputs",
         }
+        extended = profile.profile_version == 3
+        if extended:
+            required.add("trustedSourceRoots")
         if not isinstance(value, dict) or set(value) != required:
             raise ValueError("Receipt fields do not match the frozen compile-input contract")
-        if value["schema"] != RECEIPT_SCHEMA or type(value["version"]) is not int or value["version"] != RECEIPT_VERSION:
+        if value["schema"] != RECEIPT_SCHEMA or type(value["version"]) is not int or value["version"] != (2 if extended else RECEIPT_VERSION):
             raise ValueError("Receipt schema/version is unsupported")
+        if extended and value["trustedSourceRoots"] != profile.context_source_roots():
+            raise ValueError("Receipt trusted roots differ from the server-owned normalized configuration")
         if value["jobId"] != job_id or not isinstance(value["profileDigest"], str):
             raise ValueError("Receipt job/profile identity is malformed")
         _bounded_text(value["inputSnapshot"], "inputSnapshot", 71)
@@ -388,7 +399,8 @@ def validate_native_compile_input_receipt(
             if not isinstance(raw, dict) or set(raw) != {"scope", "path", "roles", "sha256", "size"}:
                 raise ValueError(f"Receipt inputs[{index}] fields are invalid")
             scope = raw["scope"]
-            if scope not in {"project", "unity"}:
+            allowed_scopes = root_mapping(profile) if extended else {"project", "unity"}
+            if not isinstance(scope, str) or scope not in allowed_scopes:
                 raise ValueError(f"Receipt inputs[{index}] scope is invalid")
             relative = _safe_relative(raw["path"])
             roles = _string_array(raw["roles"], f"Receipt inputs[{index}].roles", maximum=4096, allow_empty=False)
@@ -403,6 +415,11 @@ def validate_native_compile_input_receipt(
                 raise ValueError("Receipt repeats an input path")
             inputs_by_key[key] = {"scope": scope, "path": relative, "roles": roles, "sha256": digest, "size": size}
 
+        if extended:
+            expected_external = {("source:" + root.root_id, path) for root in profile.trusted_source_roots for path in root.inputs}
+            recorded_external = {key for key in inputs_by_key if key[0].startswith("source:")}
+            if recorded_external != expected_external:
+                raise ValueError("Receipt external inputs differ from the explicit server-owned file set")
         before = value["inputSetSha256Before"]
         after = value["inputSetSha256After"]
         if not isinstance(before, str) or not SHA256_RE.fullmatch(before) or not isinstance(after, str) or not SHA256_RE.fullmatch(after):
@@ -437,10 +454,13 @@ def validate_native_compile_input_receipt(
             raise ValueError("Receipt Unity toolchain file set is incomplete or stale")
 
         for (scope, relative), raw in inputs_by_key.items():
-            root = profile.project_root if scope == "project" else profile.unity_root
-            candidate = Path(os.path.abspath(root / PurePosixPath(relative)))
-            _reject_reparse_path(root, candidate)
-            resolved = candidate.resolve(strict=True)
+            if extended:
+                resolved = verified_input_path(profile, scope, relative, _reject_reparse_path)
+            else:
+                root = profile.project_root if scope == "project" else profile.unity_root
+                candidate = Path(os.path.abspath(root / PurePosixPath(relative)))
+                _reject_reparse_path(root, candidate)
+                resolved = candidate.resolve(strict=True)
             if not resolved.is_file():
                 raise ValueError("Receipt input is not a regular file")
             actual_hash, actual_size = _hash_file(resolved)
@@ -450,6 +470,11 @@ def validate_native_compile_input_receipt(
         assemblies = value["assemblies"]
         if not isinstance(assemblies, list) or not 1 <= len(assemblies) <= MAX_RECEIPT_ASSEMBLIES:
             raise ValueError("Receipt compile-result assembly graph is empty or too large")
+        expected_roles: dict[tuple[str, str], set[str]] | None = None
+        if extended:
+            expected_roles = {("project", path): set(roles) for path, roles in expected_config.items()}
+            for path, roles in expected_toolchain.items():
+                expected_roles.setdefault(("unity", path), set()).update(roles)
         names: set[str] = set()
         for index, assembly in enumerate(assemblies):
             if not isinstance(assembly, dict) or set(assembly) != ASSEMBLY_GRAPH_FIELDS:
@@ -464,23 +489,26 @@ def validate_native_compile_input_receipt(
             _bounded_text(assembly["flags"], f"{name}.flags", 512)
             options = _validate_compiler_options(assembly["compilerOptions"], f"{name}.compilerOptions")
             for source in source_files:
-                _require_recorded_role(profile, inputs_by_key, source, f"assembly-source:{name}")
+                _require_recorded_role(profile, inputs_by_key, source, f"assembly-source:{name}", expected_roles)
             for reference in references:
-                _require_recorded_role(profile, inputs_by_key, reference, f"assembly-reference:{name}")
+                _require_recorded_role(profile, inputs_by_key, reference, f"assembly-reference:{name}", expected_roles)
             path_fields = (
                 ("analyzerConfigPath", "compiler-analyzer-config"),
                 ("roslynAnalyzerRulesetPath", "compiler-analyzer-ruleset"),
             )
             for field, role_prefix in path_fields:
                 if options[field] not in (None, ""):
-                    _require_recorded_role(profile, inputs_by_key, options[field], f"{role_prefix}:{name}")
+                    _require_recorded_role(profile, inputs_by_key, options[field], f"{role_prefix}:{name}", expected_roles)
             for field, role_prefix in (
                 ("responseFiles", "compiler-response"),
                 ("roslynAdditionalFilePaths", "compiler-additional-file"),
                 ("roslynAnalyzerDllPaths", "compiler-analyzer-dll"),
             ):
                 for path in options[field]:
-                    _require_recorded_role(profile, inputs_by_key, path, f"{role_prefix}:{name}")
+                    _require_recorded_role(profile, inputs_by_key, path, f"{role_prefix}:{name}", expected_roles)
+
+        if extended and {key: set(raw["roles"]) for key, raw in inputs_by_key.items()} != expected_roles:
+            raise ValueError("Receipt contains missing or additional graph/configuration input paths or roles")
 
         receipt_parent = Path(receipt_path).resolve(strict=True).parent
         if not receipt_parent.is_dir() or _is_reparse(receipt_parent.lstat()):

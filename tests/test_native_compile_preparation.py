@@ -205,9 +205,17 @@ class SyntheticEditorJobTransport(EditorJobTransport):
         assembly_name = context["assemblies"][0]["name"]
         add_input("project", source_path.relative_to(self.project_root).as_posix(), f"assembly-source:{assembly_name}")
         add_input("project", reference_path.relative_to(self.project_root).as_posix(), f"assembly-reference:{assembly_name}")
+        source_files = [str(source_path)]
+        root_by_scope = {"project": self.project_root, "unity": self.unity_root}
+        for root in context.get("trustedSourceRoots", []):
+            scope = "source:" + root["rootId"]
+            root_by_scope[scope] = Path(root["path"])
+            for relative in root["inputs"]:
+                add_input(scope, relative, f"assembly-source:{assembly_name}")
+                source_files.append(str(Path(root["path"]) / relative))
         receipt_inputs = []
         for (scope, relative), roles in sorted(input_roles.items()):
-            root = self.project_root if scope == "project" else self.unity_root
+            root = root_by_scope[scope]
             path = root / Path(relative)
             contents = path.read_bytes()
             receipt_inputs.append({
@@ -231,7 +239,7 @@ class SyntheticEditorJobTransport(EditorJobTransport):
         }
         receipt_assemblies = [{
             "name": assembly_name,
-            "sourceFiles": [str(source_path)],
+            "sourceFiles": source_files,
             "allReferences": [str(reference_path)],
             "compilerOptions": compiler_options,
             "defines": ["SYNTHETIC"],
@@ -245,7 +253,7 @@ class SyntheticEditorJobTransport(EditorJobTransport):
             receipt_outputs.append({"relativePath": relative, "sha256": artifact["sha256"], "size": artifact["size"]})
         receipt = {
             "schema": "relay.liveloop.native-compile-input-receipt",
-            "version": 1,
+            "version": 2 if context["version"] == 4 else 1,
             "profileDigest": context["profileDigest"],
             "jobId": ticket.job_id,
             "inputSnapshot": ticket.input_snapshot,
@@ -281,6 +289,8 @@ class SyntheticEditorJobTransport(EditorJobTransport):
             "inputSetMatches": True,
             "outputs": receipt_outputs,
         }
+        if context["version"] == 4:
+            receipt["trustedSourceRoots"] = context["trustedSourceRoots"]
         receipt_bytes = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         receipt_id = add_artifact("compile-input-receipt.json", "compile-input-receipt", "application/json", receipt_bytes)
         if self.mode == "noop":
