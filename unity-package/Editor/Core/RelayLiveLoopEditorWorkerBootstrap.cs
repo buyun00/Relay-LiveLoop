@@ -13,12 +13,15 @@ namespace RelayLiveLoop
         private const string ArtifactRootEnvironmentKey = "RELAYLIVELOOP_ARTIFACT_ROOT";
         private static readonly EditorJobProviderRegistry Providers = new EditorJobProviderRegistry();
         private static RelayLiveLoopEditorWorker _worker;
+        private static string _configuredJobRoot;
 
         static RelayLiveLoopEditorWorkerBootstrap()
         {
             AssemblyReloadEvents.beforeAssemblyReload += BeforeAssemblyReload;
             TryRestoreConfiguration();
         }
+
+        public static string ConfiguredJobRoot { get { return _worker == null ? null : _configuredJobRoot; } }
 
         public static bool IsConfigured { get { return _worker != null; } }
 
@@ -40,6 +43,7 @@ namespace RelayLiveLoop
         {
             EditorApplication.update -= Tick;
             _worker = null;
+            _configuredJobRoot = null;
             SessionState.EraseString(JobRootSessionKey);
             SessionState.EraseString(ArtifactRootSessionKey);
         }
@@ -72,6 +76,7 @@ namespace RelayLiveLoop
             _worker = new RelayLiveLoopEditorWorker(
                 new AtomicEditorJobStore(jobRoot, artifactRoot),
                 Providers);
+            _configuredJobRoot = System.IO.Path.GetFullPath(jobRoot);
             EditorApplication.update += Tick;
         }
 
@@ -84,6 +89,7 @@ namespace RelayLiveLoop
         {
             EditorApplication.update -= Tick;
             _worker = null;
+            _configuredJobRoot = null;
             Providers.Clear();
         }
     }
