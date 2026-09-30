@@ -9,6 +9,7 @@ from host.artifacts import ArtifactStore
 from host.evidence import EvidenceStore
 from host.errors import CommandError, capability_unavailable
 from host.ledger import Ledger
+from host.change_routing import RouteSelectionError, validate_component_analysis
 from host.native_compile_receipt import (
     COMPILER_INPUT_COVERAGE_ENUMERATED_ONLY,
     validate_compiler_input_coverage,
@@ -214,6 +215,7 @@ class UpdateCoordinator:
             plan_id = command["arguments"].get("planId")
             plan = self.ledger.get_plan(plan_id) if plan_id else self._prepare_plan(job_id, command)
             self._bind_job_plan(job_id, plan["planId"])
+            self._retain_apply_evidence(job_id, plan)
             if plan["approvalRequired"] and not plan["approvalRef"]:
                 self.ledger.update_job(
                     job_id,
@@ -321,6 +323,10 @@ class UpdateCoordinator:
                 recoverable=False,
             )
         normalized = self._validate_preparation(prepared, task, provider.current_input_snapshot(task), before, job_id=job_id)
+        if normalized["route"] == "HOTFIX":
+            route_checker = getattr(self.runtime_provider, "supports_route", None)
+            if not callable(route_checker) or route_checker("HOTFIX") is not True:
+                raise capability_unavailable("native_hotfix", "Body-only changes require a compatible verified Hotfix capability before a plan can be created.")
         self._verify_required_artifacts(normalized["artifacts"], normalized["requiredArtifactKinds"])
         receipt_verifier = getattr(provider, "verify_preparation_receipt", None)
         composite_verifier = getattr(provider, "verify_preparation_plan", None)
@@ -619,7 +625,12 @@ class UpdateCoordinator:
                 self._validate_preparation_evidence(
                     evidence, value["artifacts"], task, job_id,
                     expected_profile_digest=expected_profile_digest,
+                    expected_input_snapshot=current_input_snapshot,
                 )
+                change_analysis = evidence["changeAnalysis"]
+                expected_route = {"BODY_ONLY": "HOTFIX", "STRUCTURE": "MODULE_RELOAD"}.get(change_analysis["disposition"])
+                if expected_route is None or value["route"] != expected_route:
+                    raise CommandError("CONTRACT_MISMATCH", "Prepared route differs from analyzed code/resource deltas.", stage="prepare", runtime_changed=False, recoverable=False)
         generations = value["targetGenerations"]
         if not isinstance(generations, dict) or set(generations) != {"moduleGeneration", "resourceRelease", "viewGeneration"}:
             raise CommandError("CONTRACT_MISMATCH", "targetGenerations fields do not match the provider contract.", stage="prepare")
@@ -656,12 +667,14 @@ class UpdateCoordinator:
         job_id: str | None,
         *,
         expected_profile_digest: str | None = None,
+        expected_input_snapshot: str | None = None,
     ) -> None:
         expected = {
             "providerId", "profileId", "editorJobId", "editorRequestDigest", "analysisArtifactId",
             "compileInputReceiptArtifactId", "compileInputReceiptSha256", "compileManifestArtifactId",
             "runtimeManifestArtifactId", "editorCandidateArtifactIds", "assemblyDiffs", "compilerInputCoverage",
             "compilerInputLimitations",
+            "changeAnalysis",
         }
         if expected_profile_digest is not None:
             expected.add("profileDigest")
@@ -671,7 +684,8 @@ class UpdateCoordinator:
             validate_compiler_input_coverage(value)
         except ValueError as exc:
             raise CommandError("CONTRACT_MISMATCH", "Preparation evidence must preserve the enumerated-only compiler input boundary.", stage="prepare", runtime_changed=False, recoverable=False) from exc
-        provider_id = getattr(self.preparation_provider, "provider_id", None)
+        code_provider = getattr(self.preparation_provider, "code_provider", self.preparation_provider)
+        provider_id = getattr(code_provider, "provider_id", None)
         if (
             value["providerId"] != provider_id
             or not isinstance(value["profileId"], str)
@@ -740,6 +754,16 @@ class UpdateCoordinator:
             ):
                 raise CommandError("CONTRACT_MISMATCH", "Preparation assembly diff values are invalid.", stage="prepare", runtime_changed=False)
             names.add(diff["name"])
+        try:
+            validate_component_analysis(
+                value["changeAnalysis"],
+                component="code",
+                provider_id=provider_id,
+                input_snapshot=expected_input_snapshot,
+                profile_digest=expected_profile_digest,
+            )
+        except RouteSelectionError as exc:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Code change analysis is unknown or not bound to current inputs.", stage="prepare", runtime_changed=False, recoverable=False) from exc
 
     @staticmethod
     def _validate_impact(value: Any) -> None:
@@ -779,6 +803,7 @@ class UpdateCoordinator:
             )
 
     def _apply_plan(self, job_id: str, command: dict[str, Any], plan: dict[str, Any]) -> None:
+        self._retain_apply_evidence(job_id, plan)
         provider = self.runtime_provider
         assert provider is not None
         task = self.ledger.get_task(plan["taskId"])
@@ -937,11 +962,12 @@ class UpdateCoordinator:
             self.ledger.set_method_state(method_state)
         state = normalized["status"]
         existing_result = self.ledger.get_job(job_id).get("result") or {}
-        result_record = {
+        result_record = dict(existing_result)
+        result_record.update({
             "appliedSteps": normalized["appliedSteps"],
             "runtimeRevisionAfter": normalized["runtimeRevisionAfter"],
             "facts": effective_facts,
-        }
+        })
         if isinstance(existing_result.get("runtimeBefore"), dict):
             result_record["runtimeBefore"] = existing_result["runtimeBefore"]
         if isinstance(existing_result.get("runtimeStageJournal"), list):
@@ -1107,7 +1133,7 @@ class UpdateCoordinator:
             connection.execute("UPDATE jobs SET plan_id = ? WHERE job_id = ?", (plan_id, job_id))
 
     def _fail_job(self, job_id: str, error: CommandError) -> None:
-        existing_result = self.ledger.get_job(job_id).get("result") or {}
+        existing_result = self.ledger.get_job(job_id).get("result")
         self.ledger.update_job(
             job_id,
             state="state_unknown" if error.code == "STATE_UNKNOWN" else "failed",
@@ -1116,6 +1142,34 @@ class UpdateCoordinator:
             result=existing_result,
             error=error.as_dict(),
         )
+
+    def _retain_apply_evidence(self, job_id: str, plan: dict[str, Any]) -> None:
+        """Keep preparation caveats through preflight failure and restart recovery."""
+        job = self.ledger.get_job(job_id)
+        result = dict(job.get("result") or {})
+        evidence = plan.get("details", {}).get("preparationEvidence")
+        if isinstance(evidence, dict) and evidence.get("schema") == "relay.liveloop.composite-preparation-evidence":
+            evidence = evidence.get("code")
+        if not isinstance(evidence, dict) and not result:
+            return
+        if not isinstance(result.get("runtimeStageJournal"), list):
+            result["runtimeStageJournal"] = []
+        if isinstance(evidence, dict):
+            try:
+                limitations = validate_compiler_input_coverage(evidence)
+            except ValueError as exc:
+                raise CommandError("CONTRACT_MISMATCH", "Apply plan omits the enumerated-only compiler input boundary.", stage="runtime_preflight", runtime_changed=False, recoverable=False) from exc
+            receipt_id = evidence.get("compileInputReceiptArtifactId")
+            receipt_hash = evidence.get("compileInputReceiptSha256")
+            if not isinstance(receipt_id, str) or not ID_RE.fullmatch(receipt_id) or not isinstance(receipt_hash, str) or not SHA256_RE.fullmatch(receipt_hash):
+                raise CommandError("CONTRACT_MISMATCH", "Apply plan has no valid compile receipt identity.", stage="runtime_preflight", runtime_changed=False, recoverable=False)
+            result.update({
+                "compilerInputCoverage": COMPILER_INPUT_COVERAGE_ENUMERATED_ONLY,
+                "compilerInputLimitations": list(limitations),
+                "compileInputReceiptArtifactId": receipt_id,
+                "compileInputReceiptSha256": receipt_hash,
+            })
+        self.ledger.update_job(job_id, state=job["state"], stage=job["stage"], runtime_changed=job["runtimeChanged"], result=result, error=job["error"])
 
     def recover_pending(self) -> list[dict[str, Any]]:
         """Recover durable jobs without repeating any possibly-dispatched runtime apply."""
@@ -1129,10 +1183,17 @@ class UpdateCoordinator:
             command = (job.get("result") or {}).get("resumeCommand")
             if job["stage"] in {"runtime_apply", "runtime_reconcile"}:
                 if self.runtime_provider is None or not job["planId"]:
+                    if job["planId"]:
+                        try:
+                            self._retain_apply_evidence(job["jobId"], self.ledger.get_plan(job["planId"]))
+                        except Exception:
+                            pass
                     self._fail_job(job["jobId"], CommandError("STATE_UNKNOWN", "Runtime reconciliation provider or plan is unavailable after restart.", stage="runtime_reconcile", runtime_changed=None, recoverable=False))
                 else:
                     plan = self.ledger.get_plan(job["planId"])
                     try:
+                        self._retain_apply_evidence(job["jobId"], plan)
+                        job = self.ledger.get_job(job["jobId"])
                         outcome = self.runtime_provider.reconcile(plan, job)
                         if outcome is None:
                             raise CommandError("STATE_UNKNOWN", "Runtime provider cannot reconcile the interrupted apply.", stage="runtime_reconcile", runtime_changed=None, recoverable=False)
@@ -1151,7 +1212,7 @@ class UpdateCoordinator:
                             state=normalized["status"],
                             stage="runtime_reconciled",
                             runtime_changed=normalized["runtimeChanged"],
-                            result={"appliedSteps": normalized["appliedSteps"], "runtimeRevisionAfter": normalized["runtimeRevisionAfter"], "facts": effective_facts},
+                            result={**(self.ledger.get_job(job["jobId"]).get("result") or {}), "appliedSteps": normalized["appliedSteps"], "runtimeRevisionAfter": normalized["runtimeRevisionAfter"], "facts": effective_facts},
                             error=normalized["error"],
                         )
                     except Exception as exc:

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from .composite_update import (
     COMPOSITE_BINDING_SCHEMA,
+    COMPOSITE_EVIDENCE_SCHEMA,
     COMPOSITE_ROUTE,
     MAX_RESOURCE_ARCHIVE_BYTES,
     MAX_RESOURCE_MANIFEST_BYTES,
@@ -17,6 +18,7 @@ from .composite_update import (
     artifact_closure_sha256,
 )
 from .errors import CommandError, capability_unavailable
+from .change_routing import verify_route_selection
 from .native_compile_receipt import validate_compiler_input_coverage
 from .validation import ID_RE, SHA256_RE
 
@@ -251,6 +253,39 @@ class PlayerRuntimeUpdateProvider:
         # Authentication is only transport evidence; route-specific preflight remains per-plan.
         return self.is_verified
 
+    def supports_route(self, route: str) -> bool:
+        """Return whether the authenticated provider has evidence for this exact route."""
+        if not isinstance(route, str) or not self.is_verified:
+            return False
+        if route == "HOTFIX":
+            loader = getattr(self._transport, "verified_route_capability", None)
+            if not callable(loader):
+                return False
+            try:
+                evidence = loader(route)
+            except Exception:
+                return False
+            return (
+                isinstance(evidence, dict)
+                and set(evidence) == {
+                    "schema", "version", "route", "sessionId", "launchId", "compatibilityId", "verified",
+                }
+                and evidence.get("schema") == "relay.liveloop.verified-route-capability"
+                and type(evidence.get("version")) is int
+                and evidence["version"] == 1
+                and evidence.get("route") == route
+                and evidence.get("sessionId") == self._session_id
+                and evidence.get("launchId") == self._launch_id
+                and isinstance(evidence.get("compatibilityId"), str)
+                and bool(evidence["compatibilityId"])
+                and evidence.get("verified") is True
+            )
+        if route == "MODULE_RELOAD":
+            return True
+        if route == COMPOSITE_ROUTE:
+            return self._ledger is not None
+        return False
+
     def observe_state(self, session_id: str) -> dict[str, Any]:
         # UpdateCoordinator calls observe_task_state when available so the private taskId is retained.
         if session_id != self._session_id:
@@ -364,6 +399,8 @@ class PlayerRuntimeUpdateProvider:
     def apply(self, plan: dict[str, Any], job_id: str) -> dict[str, Any]:
         if not isinstance(plan, dict) or plan.get("route") not in SUPPORTED_ROUTES:
             raise capability_unavailable("runtime_apply", "The prepared route is not supported by this Player runtime provider.")
+        if not self.supports_route(plan["route"]):
+            raise capability_unavailable("runtime_apply", f"No compatible verified runtime capability exists for route {plan['route']!r}.")
         if plan.get("sessionId") != self._session_id:
             raise CommandError("WRONG_SESSION", "Plan targets another Player session.", stage="runtime_apply", runtime_changed=False, recoverable=False)
         if plan["route"] == COMPOSITE_ROUTE:
@@ -1373,11 +1410,25 @@ class PlayerRuntimeUpdateProvider:
             evidence = details.get("preparationEvidence")
             if (
                 not isinstance(evidence, dict)
-                or evidence.get("schema") != "relay.liveloop.composite-preparation-evidence"
+                or evidence.get("schema") != COMPOSITE_EVIDENCE_SCHEMA
+                or evidence.get("version") != 2
                 or evidence.get("code", {}).get("runtimeManifestArtifactId") != code["manifestArtifactId"]
                 or evidence.get("resource") != resource.get("editorEvidence")
             ):
                 raise ValueError("composite preparation evidence differs from the candidate binding")
+            route_selection = verify_route_selection(evidence.get("routeSelection"))
+            if (
+                route_selection.get("route") != COMPOSITE_ROUTE
+                or route_selection.get("codeAnalysis", {}).get("inputSnapshot") != code.get("inputSnapshot")
+                or route_selection.get("codeAnalysis", {}).get("profileDigest") != code.get("profileDigest")
+                or route_selection.get("codeAnalysis", {}).get("providerId") != code.get("providerId")
+                or route_selection.get("codeAnalysis", {}).get("disposition") != "STRUCTURE"
+                or route_selection.get("resourceAnalysis", {}).get("inputSnapshot") != resource.get("inputSnapshot")
+                or route_selection.get("resourceAnalysis", {}).get("profileDigest") != resource.get("profileDigest")
+                or route_selection.get("resourceAnalysis", {}).get("providerId") != resource.get("providerId")
+                or route_selection.get("resourceAnalysis", {}).get("disposition") != "CHANGED"
+            ):
+                raise ValueError("composite route-selection evidence does not bind both changed components")
             code_evidence = evidence["code"]
             validate_compiler_input_coverage(code_evidence)
             receipt_id = code_evidence.get("compileInputReceiptArtifactId")
@@ -1800,4 +1851,4 @@ def create_native_update_providers(
         raise ValueError("resource_provider requires the durable Host ledger")
     from .composite_update import CompositePreparationProvider
 
-    return CompositePreparationProvider(code_provider, resource_provider, artifacts, ledger), runtime
+    return CompositePreparationProvider(code_provider, resource_provider, artifacts, ledger, runtime_provider=runtime), runtime

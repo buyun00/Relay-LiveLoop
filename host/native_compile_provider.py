@@ -9,6 +9,11 @@ from typing import Any
 
 from .editor_transport import EditorJobEnvelope
 from .errors import CommandError, capability_unavailable
+from .change_routing import (
+    RouteSelectionError,
+    classify_native_assemblies,
+    make_code_analysis,
+)
 from .native_compile_profile import (
     NativeCompileProfile,
     NativeCompileProfileRegistry,
@@ -172,7 +177,10 @@ class NativeSourcePreparationProvider:
             },
         )
         result = self._editor.wait(ticket, timeout_seconds=profile.timeout_seconds)
-        return self._finish_editor_result(job_id, task, profile, binding, result, ticket.request_digest)
+        return self._finish_editor_result(
+            job_id, task, profile, binding, result, ticket.request_digest,
+            allow_unchanged=binding["allowUnchanged"],
+        )
 
     def reconcile_prepare(self, job: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | None:
         job_id = job.get("jobId")
@@ -199,7 +207,10 @@ class NativeSourcePreparationProvider:
         recovered_result = self._editor.poll_result(ticket)
         if recovered_result is None:
             return None
-        return self._finish_editor_result(job_id, task, profile, binding, recovered_result, ticket.request_digest)
+        return self._finish_editor_result(
+            job_id, task, profile, binding, recovered_result, ticket.request_digest,
+            allow_unchanged=binding["allowUnchanged"],
+        )
 
     def _make_binding(self, task: dict[str, Any], request: dict[str, Any], profile: NativeCompileProfile) -> dict[str, Any]:
         try:
@@ -235,9 +246,12 @@ class NativeSourcePreparationProvider:
             raise CommandError("CONTRACT_MISMATCH", "Prepare binding fields are incomplete.", stage="prepare", runtime_changed=False, recoverable=False)
         if not isinstance(request.get("jobId"), str) or not ID_RE.fullmatch(request["jobId"]):
             raise CommandError("CONTRACT_MISMATCH", "Prepare binding jobId is invalid.", stage="prepare", runtime_changed=False, recoverable=False)
+        allow_unchanged = request.get("allowUnchanged", False)
+        if type(allow_unchanged) is not bool:
+            raise CommandError("CONTRACT_MISMATCH", "allowUnchanged must be an internal boolean preparation binding.", stage="prepare", runtime_changed=False, recoverable=False)
         return {
             "schema": "relay.liveloop.native-prepare-binding",
-            "version": 2,
+            "version": 3,
             "providerId": self.provider_id,
             "jobId": request["jobId"],
             "profileId": profile.profile_id,
@@ -248,6 +262,7 @@ class NativeSourcePreparationProvider:
             "taskUpdatedAt": task_updated_at,
             "inputSnapshot": snapshot,
             "runtimeState": dict(runtime_state),
+            "allowUnchanged": allow_unchanged,
         }
 
     def _verify_binding(
@@ -262,10 +277,10 @@ class NativeSourcePreparationProvider:
         if (
             set(binding) != {
                 "schema", "version", "providerId", "jobId", "profileId", "profileDigest", "taskId", "sessionId",
-                "launchId", "taskUpdatedAt", "inputSnapshot", "runtimeState",
+                "launchId", "taskUpdatedAt", "inputSnapshot", "runtimeState", "allowUnchanged",
             }
             or binding.get("schema") != "relay.liveloop.native-prepare-binding"
-            or binding.get("version") != 2
+            or binding.get("version") != 3
             or binding.get("providerId") != self.provider_id
             or binding.get("jobId") != job_id
             or binding.get("profileId") != profile.profile_id
@@ -276,6 +291,7 @@ class NativeSourcePreparationProvider:
             or binding.get("taskUpdatedAt") != task.get("updatedAt")
             or binding.get("inputSnapshot") != self.current_input_snapshot(task)
             or not isinstance(runtime_state, dict)
+            or type(binding.get("allowUnchanged")) is not bool
             or set(runtime_state) != {"sessionId", "runtimeRevision", "moduleGeneration", "resourceRelease", "viewGeneration"}
             or runtime_state.get("sessionId") != task.get("sessionId")
             or not isinstance(runtime_state.get("runtimeRevision"), str)
@@ -416,6 +432,8 @@ class NativeSourcePreparationProvider:
         binding: dict[str, Any],
         editor_result: dict[str, Any],
         request_digest: str,
+        *,
+        allow_unchanged: bool = False,
     ) -> dict[str, Any]:
         self._verify_binding(task, profile, binding, job_id=job_id)
         verify_profile_baselines(profile)
@@ -488,7 +506,31 @@ class NativeSourcePreparationProvider:
                 for item in analysis["files"]
             ],
         )
+        try:
+            change_analysis = make_code_analysis(
+                profile,
+                analysis_document["assemblies"],
+                input_snapshot=binding["inputSnapshot"],
+                profile_digest=binding["profileDigest"],
+                provider_id=self.provider_id,
+            )
+        except RouteSelectionError as exc:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Native code change classification is unknown; automatic routing is refused.", stage="compile_compare", runtime_changed=False, recoverable=False) from exc
         route = self._choose_route(profile, analysis)
+        if route == "UNCHANGED":
+            if not allow_unchanged:
+                raise CommandError("RESOURCE_BUILD_FAILED", "Compile completed but no managed code or structure differs from baseline.", stage="compile_compare", runtime_changed=False, recoverable=False)
+            return {
+                "componentAnalysisOnly": True,
+                "inputSnapshot": binding["inputSnapshot"],
+                "profileDigest": binding["profileDigest"],
+                "expectedRuntimeRevision": state["runtimeRevision"],
+                "changeAnalysis": change_analysis,
+            }
+        if route == "HOTFIX":
+            checker = getattr(self._runtime, "supports_route", None)
+            if not callable(checker) or checker("HOTFIX") is not True:
+                raise capability_unavailable("native_hotfix", "Body-only changes require a compatible verified Hotfix capability; no Hotfix candidate will be emitted.")
         native_manifest, runtime_payload_ids = self._build_runtime_manifest(
             job_id, task, profile, binding, analysis, route, registered_by_editor_id
         )
@@ -564,6 +606,7 @@ class NativeSourcePreparationProvider:
                     }
                     for item in analysis["assemblies"]
                 ],
+                "changeAnalysis": change_analysis,
             },
         }
         self._save_job(job_id, "prepare_candidate_ready", {"prepareProviderResult": prepared})
@@ -706,16 +749,16 @@ class NativeSourcePreparationProvider:
 
     @staticmethod
     def _choose_route(profile: NativeCompileProfile, analysis: dict[str, Any]) -> str:
-        changed = [item for item in analysis["assemblies"] if not item["structureEqual"] or item["changedMethods"]]
-        if not changed:
-            raise CommandError("RESOURCE_BUILD_FAILED", "Compile completed but no managed code or structure differs from baseline.", stage="compile_compare", runtime_changed=False, recoverable=False)
-        if (
-            len(changed) == 1
-            and changed[0]["structureEqual"]
-            and changed[0]["changedMethods"]
-            and changed[0]["moduleId"] == profile.module_id
-        ):
+        try:
+            disposition, hotfix_shape_verified = classify_native_assemblies(profile, analysis.get("assemblies"))
+        except RouteSelectionError as exc:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Native code change classification is unknown; automatic routing is refused.", stage="compile_compare", runtime_changed=False, recoverable=False) from exc
+        if disposition == "UNCHANGED":
+            return "UNCHANGED"
+        if disposition == "BODY_ONLY" and hotfix_shape_verified:
             return "HOTFIX"
+        if disposition == "BODY_ONLY":
+            raise capability_unavailable("native_hotfix", "Body-only changes do not fit the verified single-assembly Hotfix contract; module reload fallback is refused.")
         return "MODULE_RELOAD"
 
     def _build_runtime_manifest(
@@ -925,6 +968,7 @@ class NativeSourcePreparationProvider:
             "compileInputReceiptArtifactId", "compileInputReceiptSha256", "compileManifestArtifactId",
             "runtimeManifestArtifactId", "editorCandidateArtifactIds", "assemblyDiffs", "compilerInputCoverage",
             "compilerInputLimitations",
+            "changeAnalysis",
         }
         try:
             evidence_limitations = validate_compiler_input_coverage(evidence)
@@ -985,6 +1029,18 @@ class NativeSourcePreparationProvider:
             or not isinstance(analysis.get("files"), list)
         ):
             raise CommandError("INPUT_CHANGED", "Sealed compile analysis differs from the plan receipt binding.", stage="compile_input_receipt", runtime_changed=False, recoverable=False)
+        try:
+            expected_change_analysis = make_code_analysis(
+                profile,
+                analysis.get("assemblies"),
+                input_snapshot=expected_input_snapshot,
+                profile_digest=profile_digest,
+                provider_id=self.provider_id,
+            )
+        except RouteSelectionError as exc:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Sealed Native code classification is unknown; automatic routing is refused.", stage="compile_input_receipt", runtime_changed=False, recoverable=False) from exc
+        if evidence.get("changeAnalysis") != expected_change_analysis:
+            raise CommandError("INPUT_CHANGED", "Code change classification differs from the sealed Native analysis artifact.", stage="compile_input_receipt", runtime_changed=False, recoverable=False)
         expected_outputs = []
         for item in analysis["files"]:
             if not isinstance(item, dict) or set(item) != {"artifactId", "assemblyName", "extension", "sha256", "size"}:

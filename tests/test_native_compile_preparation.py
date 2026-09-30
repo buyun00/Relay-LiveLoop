@@ -372,6 +372,7 @@ class SyntheticResourcePreparationProvider:
         self.source_path = source_path
         self.fail_build = False
         self.prepare_calls = 0
+        self.change_disposition = "CHANGED"
 
     def profile_for_task(self, _task: dict[str, Any]) -> SimpleNamespace:
         return SimpleNamespace(profile_id="synthetic-resource-profile")
@@ -382,6 +383,21 @@ class SyntheticResourcePreparationProvider:
 
     def current_profile_digest(self, _task: dict[str, Any]) -> str:
         return "sha256:" + hashlib.sha256(b"synthetic-resource-profile-v1").hexdigest()
+
+    def analyze_changes(self, task: dict[str, Any]) -> dict[str, Any]:
+        material = {
+            "schema": "relay.liveloop.change-analysis",
+            "version": 1,
+            "component": "resource",
+            "disposition": self.change_disposition,
+            "inputSnapshot": self.current_input_snapshot(task),
+            "profileDigest": self.current_profile_digest(task),
+            "providerId": self.provider_id,
+        }
+        evidence_sha256 = hashlib.sha256(
+            json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {**material, "evidenceSha256": evidence_sha256}
 
     def prepare(self, task: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
         self.prepare_calls += 1
@@ -444,6 +460,7 @@ class SyntheticResourcePreparationProvider:
         return {
             "inputSnapshot": input_snapshot,
             "profileDigest": profile_digest,
+            "changeAnalysis": request["changeAnalysis"],
             "expectedRuntimeRevision": state["runtimeRevision"],
             "resourceReleaseBefore": state["resourceRelease"],
             "resourceReleaseAfter": release_after,
@@ -659,7 +676,9 @@ class NativeCompilePreparationTests(unittest.TestCase):
         source_path.write_bytes(b"synthetic resource inputs v1")
         resource_provider = SyntheticResourcePreparationProvider(self.artifacts, self.artifact_root, source_path)
         resource_provider.fail_build = fail_build
-        composite = CompositePreparationProvider(self.preparation, resource_provider, self.artifacts, self.ledger)
+        composite = CompositePreparationProvider(
+            self.preparation, resource_provider, self.artifacts, self.ledger, runtime_provider=self.runtime
+        )
         self.service.coordinator.preparation_provider = composite
         self.service.coordinator.preparation_verified = composite.is_verified
         return resource_provider
@@ -1108,6 +1127,71 @@ class NativeCompilePreparationTests(unittest.TestCase):
         self.assertEqual(1, resource_provider.prepare_calls)
         self.assertEqual([], self.player.mutations)
 
+    def test_resource_only_delta_does_not_build_or_reload_code_without_resource_runtime_capability(self) -> None:
+        resource_provider = self._install_composite_provider()
+        self.editor.mode = "noop"
+        task_id = self._open_task("MODULE_AND_ASSET_RELOAD")
+        job = self._prepare(task_id)
+
+        self.assertEqual("failed", job["state"], job)
+        self.assertEqual("CAPABILITY_UNAVAILABLE", job["error"]["code"])
+        self.assertEqual("RESOURCE_ONLY", job["error"]["details"]["routeSelection"]["route"])
+        self.assertTrue(job["error"]["details"]["automaticRouteSelection"])
+        self.assertEqual(0, resource_provider.prepare_calls)
+        self.assertEqual(1, self.editor.compile_count)
+        self.assertEqual([], self.player.mutations)
+        with self.assertRaises(CommandError):
+            self.ledger.get_plan(self.service.coordinator._prepare_plan_id(job["jobId"]))
+
+    def test_unknown_resource_delta_fails_before_compile_or_candidate_build(self) -> None:
+        resource_provider = self._install_composite_provider()
+        resource_provider.change_disposition = "UNKNOWN"
+        task_id = self._open_task("MODULE_AND_ASSET_RELOAD")
+        job = self._prepare(task_id)
+
+        self.assertEqual("failed", job["state"], job)
+        self.assertEqual("CAPABILITY_UNAVAILABLE", job["error"]["code"])
+        self.assertEqual(0, self.editor.compile_count)
+        self.assertEqual(0, resource_provider.prepare_calls)
+        self.assertEqual([], self.player.mutations)
+
+    def test_body_only_change_requires_session_bound_verified_hotfix_capability(self) -> None:
+        self.player.hotfix_capability_available = False
+        self.editor.mode = "hotfix"
+        task_id = self._open_task("HOTFIX")
+        job = self._prepare(task_id)
+
+        self.assertEqual("failed", job["state"], job)
+        self.assertEqual("CAPABILITY_UNAVAILABLE", job["error"]["code"])
+        self.assertEqual([], self.player.mutations)
+        with self.assertRaises(CommandError):
+            self.ledger.get_plan(self.service.coordinator._prepare_plan_id(job["jobId"]))
+
+    def test_body_only_plus_resource_delta_is_not_silently_upgraded_to_module_reload(self) -> None:
+        resource_provider = self._install_composite_provider()
+        self.editor.mode = "hotfix"
+        task_id = self._open_task("MODULE_AND_ASSET_RELOAD")
+        job = self._prepare(task_id)
+
+        self.assertEqual("failed", job["state"], job)
+        self.assertEqual("CAPABILITY_UNAVAILABLE", job["error"]["code"])
+        self.assertEqual("HOTFIX_AND_ASSET_RELOAD", job["error"]["details"]["routeSelection"]["route"])
+        self.assertEqual(0, resource_provider.prepare_calls)
+        self.assertEqual([], self.player.mutations)
+
+    def test_unchanged_resource_delta_returns_automatic_code_only_route(self) -> None:
+        resource_provider = self._install_composite_provider()
+        resource_provider.change_disposition = "UNCHANGED"
+        self.editor.mode = "module"
+        task_id = self._open_task("MODULE_RELOAD")
+        job = self._prepare(task_id)
+
+        self.assertEqual("completed", job["state"], job)
+        plan = job["result"]["plan"]
+        self.assertEqual("MODULE_RELOAD", plan["route"])
+        self.assertEqual(native_input_snapshot(self.profiles.for_task(self.ledger.get_task(task_id))), plan["inputSnapshot"])
+        self.assertEqual(0, resource_provider.prepare_calls)
+
     def test_composite_resource_tamper_is_rejected_before_player_mutation(self) -> None:
         self._install_composite_provider()
         task_id = self._open_task("MODULE_AND_ASSET_RELOAD")
@@ -1141,6 +1225,10 @@ class NativeCompilePreparationTests(unittest.TestCase):
         self.assertEqual(plan["inputSnapshot"], binding["inputSnapshot"])
         self.assertEqual(plan["details"]["preparationEvidence"]["profileDigest"], binding["profileDigest"])
         code_evidence = plan["details"]["preparationEvidence"]["code"]
+        route_selection = plan["details"]["preparationEvidence"]["routeSelection"]
+        self.assertEqual("MODULE_AND_ASSET_RELOAD", route_selection["route"])
+        self.assertEqual("STRUCTURE", route_selection["codeAnalysis"]["disposition"])
+        self.assertEqual("CHANGED", route_selection["resourceAnalysis"]["disposition"])
         self.assertEqual(COMPILER_INPUT_COVERAGE_ENUMERATED_ONLY, code_evidence["compilerInputCoverage"])
         self.assertEqual(REQUIRED_COMPILER_INPUT_LIMITATIONS, set(code_evidence["compilerInputLimitations"]))
         self.assertEqual(artifact_closure_sha256(code["artifacts"]), code["artifactClosureSha256"])

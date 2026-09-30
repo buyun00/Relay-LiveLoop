@@ -183,6 +183,16 @@ namespace RelayLiveLoop
                     continue;
                 }
 
+                // Older workers archived attempts before durable tombstones were
+                // introduced. Adopt that evidence before a queued duplicate can
+                // become eligible for Begin after an upgrade.
+                string legacyProblem;
+                if (!RestoreLegacyAttemptTombstone(request, digest, out legacyProblem))
+                {
+                    PreserveInvalid(files[index], "legacy-attempt-unknown");
+                    continue;
+                }
+
                 var tombstonePath = GetAttemptTombstonePath(request.jobId);
                 if (File.Exists(tombstonePath))
                 {
@@ -237,6 +247,11 @@ namespace RelayLiveLoop
             {
                 if (string.IsNullOrEmpty(claim.RecoveryProblem)) PersistAttemptTombstone(claim.Attempt);
                 return claim.Attempt;
+            }
+            string legacyProblem;
+            if (!RestoreLegacyAttemptTombstone(claim.Request, claim.RequestDigest, out legacyProblem))
+            {
+                throw new InvalidDataException(legacyProblem);
             }
             var tombstonePath = GetAttemptTombstonePath(claim.Request.jobId);
             if (File.Exists(tombstonePath))
@@ -620,8 +635,12 @@ namespace RelayLiveLoop
 
         private EditorJobAttemptRecord ReadAttemptTombstone(string jobId, out string problem)
         {
+            return ReadAttemptRecord(GetAttemptTombstonePath(jobId), jobId, out problem);
+        }
+
+        private EditorJobAttemptRecord ReadAttemptRecord(string path, string jobId, out string problem)
+        {
             problem = null;
-            var path = GetAttemptTombstonePath(jobId);
             try
             {
                 var value = JsonUtility.FromJson<EditorJobAttemptRecord>(File.ReadAllText(path, Encoding.UTF8));
@@ -647,6 +666,42 @@ namespace RelayLiveLoop
                 problem = "Attempt tombstone cannot be read: " + ex.GetType().Name;
                 return null;
             }
+        }
+
+        private bool RestoreLegacyAttemptTombstone(EditorJobRequest request, string digest, out string problem)
+        {
+            problem = null;
+            if (File.Exists(GetAttemptTombstonePath(request.jobId))) return true;
+            var paths = new List<string>();
+            var active = GetAttemptPath(request.jobId);
+            if (File.Exists(active)) paths.Add(active);
+            var archived = Directory.GetFiles(_archive, "*.attempt.json");
+            Array.Sort(archived, StringComparer.Ordinal);
+            for (var index = 0; index < archived.Length; index++)
+            {
+                var name = Path.GetFileName(archived[index]);
+                if (name.StartsWith(request.jobId + ".", StringComparison.Ordinal) ||
+                    name.IndexOf("." + request.jobId + ".", StringComparison.Ordinal) >= 0)
+                {
+                    paths.Add(archived[index]);
+                }
+            }
+
+            EditorJobAttemptRecord prior = null;
+            for (var index = 0; index < paths.Count; index++)
+            {
+                string readProblem;
+                var value = ReadAttemptRecord(paths[index], request.jobId, out readProblem);
+                if (!string.IsNullOrEmpty(readProblem) || !AttemptMatchesRequest(value, request, digest) ||
+                    (prior != null && !SameAttempt(prior, value)))
+                {
+                    problem = "Legacy attempt evidence is unreadable, contradictory, or belongs to another request; fresh Begin is forbidden.";
+                    return false;
+                }
+                prior = value;
+            }
+            if (prior != null) PersistAttemptTombstone(prior);
+            return true;
         }
 
         private void PersistAttemptTombstone(EditorJobAttemptRecord attempt)

@@ -1,16 +1,28 @@
 # Native runtime update Host contract
 
-Status: public Host source integration from isolated candidate v005. Static and synthetic checks do not establish real Unity, Player, native, device, or production acceptance.
+Status: isolated v006 Host implementation candidate, based on frozen v005. Synthetic and static checks do not establish real Unity, Player, native, device, or production acceptance. The private adapter and production repositories are outside this candidate and were not modified.
 
 ## Scope and composition
 
 The public v1 command operations remain unchanged. Callers use the existing task, prepare, iterate, status, and artifact flows. Native runtime calls stay behind the authenticated runtime `invoke` boundary; they are not added to `execute`, `validate_command`, HTTP, CLI, or MCP operation registries.
 
-The ordinary prepared routes remain `HOTFIX` and `MODULE_RELOAD`. `MODULE_AND_ASSET_RELOAD` is optional and enabled only when a `CompositePreparationProvider` is explicitly constructed with both a code provider and a resource provider. The default `create_native_update_providers` composition leaves `resource_provider` unset, so this route is not enabled by default. Tests inject a synthetic resource provider; no private/live resource activation handler is included.
+The public v1 command operations remain unchanged. Callers do not supply a route or runtime manifest to choose the path. Profile-backed code analysis classifies each compiler result as `BODY_ONLY`, `STRUCTURE`, or `UNCHANGED`; a resource provider must expose read-only `analyze_changes(task)` evidence bound to its current input snapshot and profile digest. Missing, malformed, unverified, or `UNKNOWN` classification fails closed.
+
+| Code analysis | Resource analysis | Automatic selection |
+| --- | --- | --- |
+| `BODY_ONLY`, one-assembly Hotfix shape verified | `UNCHANGED` | `HOTFIX`, gated by session-bound verified Hotfix capability evidence |
+| `STRUCTURE` | `UNCHANGED` | `MODULE_RELOAD` |
+| `UNCHANGED` | `CHANGED` | `RESOURCE_ONLY` |
+| `BODY_ONLY` | `CHANGED` | `HOTFIX_AND_ASSET_RELOAD` |
+| `STRUCTURE` | `CHANGED` | `MODULE_AND_ASSET_RELOAD` |
+
+`BODY_ONLY` with an unsupported shape or missing Hotfix capability is refused; it is not silently routed to module reload. When the resource analysis is `UNCHANGED`, the composite wrapper delegates the code-only input/profile boundary and does not build or bind a resource candidate. A resource-only delta is classified without generating a code-reload candidate. The batch contains no executable `RESOURCE_ONLY` or `HOTFIX_AND_ASSET_RELOAD` handler, so those routes require a V-owned runtime capability and fail before resource build/apply when absent. The current Host transport does not implement the new session-bound Hotfix capability response either; Hotfix plans are not created without it.
+
+`MODULE_AND_ASSET_RELOAD` remains an optional route enabled only when a `CompositePreparationProvider` is explicitly constructed with both a code provider and a resource provider. The normal `_serve` composition does not configure a resource provider. The included resource analyzer/provider is synthetic; this batch contains no private/live resource adapter or activation handler.
 
 The composite immutable plan binds task/session/input/profile/runtime state, code manifest and payload closure, resource manifest and archive closure, context requirements, affected views/modules, resource-release transition, and before/after generations. One coordinator apply invokes the runtime provider once; it is not one atomic Player transaction. Its separately journaled mutation order is `module.quiesce`, `module.dispose`, `module.load`, `resource.activate`, `module.restore`. There is no rollback. Each dispatched stage records its identity, before/after observation, and acknowledgement state. A known partial transition retains the exact acknowledged steps; lost or contradictory attribution is `STATE_UNKNOWN` with `runtimeChanged: null`, forbids replay, and requires a fresh session.
 
-The code-only `MODULE_RELOAD` path preserves the current resource release. It does not imply a paired resource update.
+The code-only `MODULE_RELOAD` path preserves the current resource release. It does not imply a paired resource update. For structural code plus changed resources, automatic-selection evidence and both input/profile bindings are retained with the common immutable plan; apply still uses the frozen sequence above.
 
 ## Runtime contract and safety
 
@@ -44,12 +56,10 @@ The neutral Editor worker also persists a per-job attempt tombstone before retur
 
 ## Verification
 
-Run the Host regression suites and synthetic C# fixtures from the repository root with:
+Run the pinned-baseline-plus-overlay checks with:
 
 ```powershell
-py -3 -B -m unittest tests.test_native_compile_preparation tests.test_native_runtime_wiring
-$unityRoot = '<Unity 2022.3 Editor installation root>'
-.\tests\unity-synthetic\native-unknown\run-synthetic.ps1 -UnityRoot $unityRoot
+.\verification\verify-in-scratch.ps1 -UnityRoot 'C:\Program Files\Unity 2022.3.62f3'
 ```
 
-The Host suite uses synthetic Editor receipts and a fake authenticated Player transport. The C# checks compile isolated fixtures with the Unity-bundled C# compiler; they do not launch Unity Editor or invoke `CompileDllCommand`. These checks do not establish an actual HybridCLR compile, compiler-process identity, complete arbitrary-input closure, Player/native runtime, device/product acceptance, or production deployment.
+The Host suite uses synthetic Editor receipts and a fake authenticated Player transport. The C# checks compile isolated fixtures with the Unity-bundled C# compiler; they do not launch Unity Editor or invoke `CompileDllCommand`. No actual HybridCLR compile, compiler-process identity proof, complete arbitrary-input closure, Player/native runtime, device/product acceptance, or publication is performed.

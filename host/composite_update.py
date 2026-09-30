@@ -6,6 +6,12 @@ from typing import Any
 
 from .errors import CommandError
 from .validation import ID_RE, SHA256_RE
+from .change_routing import (
+    RouteSelectionError,
+    select_route,
+    validate_component_analysis,
+    verify_route_selection,
+)
 
 
 COMPOSITE_ROUTE = "MODULE_AND_ASSET_RELOAD"
@@ -84,11 +90,13 @@ class CompositePreparationProvider:
     provider_id = "composite-code-resource-preparation"
     is_composite_preparation_provider = True
 
-    def __init__(self, code_provider: Any, resource_provider: Any, artifacts: Any, ledger: Any) -> None:
+    def __init__(self, code_provider: Any, resource_provider: Any, artifacts: Any, ledger: Any, runtime_provider: Any | None = None) -> None:
         if code_provider is None or not callable(getattr(code_provider, "prepare", None)):
             raise ValueError("code_provider must expose prepare(task, request)")
         if resource_provider is None or not callable(getattr(resource_provider, "prepare", None)):
             raise ValueError("resource_provider must expose prepare(task, request)")
+        if not callable(getattr(resource_provider, "analyze_changes", None)):
+            raise ValueError("resource_provider must expose read-only analyze_changes(task)")
         if artifacts is None or not callable(getattr(artifacts, "open_verified", None)):
             raise ValueError("artifacts must expose verified immutable reads")
         if ledger is None or not callable(getattr(ledger, "get_artifact", None)) or not callable(getattr(ledger, "get_job", None)):
@@ -102,6 +110,7 @@ class CompositePreparationProvider:
         self.resource_provider = resource_provider
         self._artifacts = artifacts
         self._ledger = ledger
+        self._runtime_provider = runtime_provider
 
     @property
     def is_verified(self) -> bool:
@@ -116,18 +125,26 @@ class CompositePreparationProvider:
         return None if self.is_verified else "Both code and resource preparation providers require verified capability evidence."
 
     def current_input_snapshot(self, task: dict[str, Any]) -> str:
+        analysis = self._analyze_resource(task)
+        code_snapshot = self.code_provider.current_input_snapshot(task)
+        if analysis["disposition"] == "UNCHANGED":
+            return code_snapshot
         value = {
-            "schema": "relay.liveloop.composite-input-snapshot/1",
-            "code": self.code_provider.current_input_snapshot(task),
-            "resource": self.resource_provider.current_input_snapshot(task),
+            "schema": "relay.liveloop.composite-input-snapshot/2",
+            "code": code_snapshot,
+            "resource": analysis["inputSnapshot"],
         }
         return "sha256:" + _sha256(value)
 
     def current_profile_digest(self, task: dict[str, Any]) -> str:
+        analysis = self._analyze_resource(task)
+        code_digest = self.code_provider.current_profile_digest(task)
+        if analysis["disposition"] == "UNCHANGED":
+            return code_digest
         value = {
-            "schema": "relay.liveloop.composite-profile-digest/1",
-            "code": self.code_provider.current_profile_digest(task),
-            "resource": self.resource_provider.current_profile_digest(task),
+            "schema": "relay.liveloop.composite-profile-digest/2",
+            "code": code_digest,
+            "resource": analysis["profileDigest"],
         }
         for key in ("code", "resource"):
             digest = value[key]
@@ -135,9 +152,61 @@ class CompositePreparationProvider:
                 raise CommandError("CONTRACT_MISMATCH", f"{key} provider returned an invalid profile digest.", stage="prepare", runtime_changed=False, recoverable=False)
         return "sha256:" + _sha256(value)
 
+    def _analyze_resource(self, task: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self.resource_provider, "is_verified", False) is not True:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Resource change analysis has no verified provider capability.", stage="prepare", runtime_changed=False, recoverable=False)
+        method = getattr(self.resource_provider, "analyze_changes", None)
+        if not callable(method):
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Resource changes cannot be classified automatically.", stage="prepare", runtime_changed=False, recoverable=False)
+        snapshot = self.resource_provider.current_input_snapshot(task)
+        digest = self.resource_provider.current_profile_digest(task)
+        try:
+            value = validate_component_analysis(
+                method(task),
+                component="resource",
+                provider_id=getattr(self.resource_provider, "provider_id", None),
+                input_snapshot=snapshot,
+                profile_digest=digest,
+            )
+        except RouteSelectionError as exc:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Resource change analysis is unknown, malformed, or not bound to current inputs.", stage="prepare", runtime_changed=False, recoverable=False) from exc
+        if value["disposition"] == "UNKNOWN":
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Resource change classification is unknown; automatic routing is refused.", stage="prepare", runtime_changed=False, recoverable=False)
+        if snapshot != self.resource_provider.current_input_snapshot(task) or digest != self.resource_provider.current_profile_digest(task):
+            raise CommandError("INPUT_CHANGED", "Resource inputs changed during automatic change analysis.", stage="source_snapshot", runtime_changed=False, recoverable=False)
+        return value
+
+    def _route_selection(self, code_analysis: Any, resource_analysis: dict[str, Any], code_snapshot: str, code_digest: str) -> dict[str, Any]:
+        try:
+            normalized_code = validate_component_analysis(
+                code_analysis,
+                component="code",
+                provider_id=getattr(self.code_provider, "provider_id", None),
+                input_snapshot=code_snapshot,
+                profile_digest=code_digest,
+            )
+            return select_route(normalized_code, resource_analysis)
+        except RouteSelectionError as exc:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "A change classification is unknown or incompatible; automatic routing is refused.", stage="prepare", runtime_changed=False, recoverable=False) from exc
+
+    def _require_route_capability(self, route_selection: dict[str, Any]) -> None:
+        route = route_selection.get("route")
+        checker = getattr(self._runtime_provider, "supports_route", None)
+        if callable(checker) and checker(route) is True:
+            return
+        raise CommandError(
+            "CAPABILITY_UNAVAILABLE",
+            f"Automatically selected route {route!r} has no compatible verified runtime capability.",
+            stage="prepare",
+            runtime_changed=False,
+            recoverable=False,
+            details={"routeSelection": route_selection, "automaticRouteSelection": True},
+        )
+
     def prepare(self, task: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+        resource_analysis = self._analyze_resource(task)
         code_snapshot = self.code_provider.current_input_snapshot(task)
-        resource_snapshot = self.resource_provider.current_input_snapshot(task)
+        resource_snapshot = resource_analysis["inputSnapshot"]
         composite_snapshot = self.current_input_snapshot(task)
         composite_profile = self.current_profile_digest(task)
         if request.get("inputSnapshot") != composite_snapshot:
@@ -155,9 +224,22 @@ class CompositePreparationProvider:
                 "profileDigest": code_profile_digest,
                 "profileId": getattr(code_profile, "profile_id", None),
                 "compositeInputSnapshot": composite_snapshot,
+                "allowUnchanged": resource_analysis["disposition"] == "CHANGED",
             }
         )
         code_prepared = self.code_provider.prepare(task, code_request)
+
+        code_digest = self.code_provider.current_profile_digest(task)
+        code_analysis = self._code_analysis(code_prepared)
+        route_selection = self._route_selection(code_analysis, resource_analysis, code_snapshot, code_digest)
+        if route_selection["route"] == "NO_CHANGES":
+            raise CommandError("RESOURCE_BUILD_FAILED", "Code and resource analysis found no changes to prepare.", stage="change_analysis", runtime_changed=False, recoverable=False, details={"routeSelection": route_selection})
+        if resource_analysis["disposition"] == "UNCHANGED":
+            self._require_route_capability(route_selection)
+            if code_prepared.get("componentAnalysisOnly") is True:
+                raise CommandError("RESOURCE_BUILD_FAILED", "No component has a candidate to prepare.", stage="change_analysis", runtime_changed=False, recoverable=False)
+            return code_prepared
+        self._require_route_capability(route_selection)
 
         resource_profile_digest = self.resource_provider.current_profile_digest(task)
         resource_profile = self._profile(self.resource_provider, task)
@@ -170,20 +252,35 @@ class CompositePreparationProvider:
                 "profileDigest": resource_profile_digest,
                 "profileId": getattr(resource_profile, "profile_id", None),
                 "compositeInputSnapshot": composite_snapshot,
+                "changeAnalysis": resource_analysis,
             }
         )
         # A build failure aborts preparation. The coordinator cannot create a plan until both return.
         resource_prepared = self.resource_provider.prepare(task, resource_request)
-        return self._compose(task, request, code_prepared, resource_prepared)
+        return self._compose(task, request, code_prepared, resource_prepared, route_selection)
 
     def reconcile_prepare(self, job: dict[str, Any], task: dict[str, Any]) -> dict[str, Any] | None:
+        resource_analysis = self._analyze_resource(task)
         code_method = getattr(self.code_provider, "reconcile_prepare", None)
         resource_method = getattr(self.resource_provider, "reconcile_prepare", None)
-        if not callable(code_method) or not callable(resource_method):
+        if not callable(code_method):
             return None
         code_prepared = code_method(job, task)
+        if code_prepared is None:
+            return None
+        if resource_analysis["disposition"] == "UNCHANGED":
+            return code_prepared
+        code_snapshot = self.code_provider.current_input_snapshot(task)
+        code_digest = self.code_provider.current_profile_digest(task)
+        route_selection = self._route_selection(self._code_analysis(code_prepared), resource_analysis, code_snapshot, code_digest)
+        if route_selection["route"] != COMPOSITE_ROUTE:
+            self._require_route_capability(route_selection)
+            raise CommandError("CAPABILITY_UNAVAILABLE", f"Automatically selected route {route_selection['route']!r} cannot be reconciled by this composite provider.", stage="prepare_reconcile", runtime_changed=False, recoverable=False, details={"routeSelection": route_selection, "automaticRouteSelection": True})
+        self._require_route_capability(route_selection)
+        if not callable(resource_method):
+            return None
         resource_prepared = resource_method(job, task)
-        if code_prepared is None or resource_prepared is None:
+        if resource_prepared is None:
             return None
         request = (job.get("result") or {}).get("prepareCoordinatorBinding")
         if not isinstance(request, dict):
@@ -200,7 +297,19 @@ class CompositePreparationProvider:
             "expectedRuntimeRevision": runtime_state.get("runtimeRevision"),
             "runtimeState": runtime_state,
         }
-        return self._compose(task, synthetic_request, code_prepared, resource_prepared)
+        return self._compose(task, synthetic_request, code_prepared, resource_prepared, route_selection)
+
+    def _code_analysis(self, prepared: Any) -> Any:
+        if not isinstance(prepared, dict):
+            raise CommandError("CONTRACT_MISMATCH", "Code provider returned no automatic change-analysis result.", stage="prepare", runtime_changed=False, recoverable=False)
+        if prepared.get("componentAnalysisOnly") is True:
+            if set(prepared) != {"componentAnalysisOnly", "inputSnapshot", "profileDigest", "expectedRuntimeRevision", "changeAnalysis"}:
+                raise CommandError("CONTRACT_MISMATCH", "Code-only analysis result fields are invalid.", stage="prepare", runtime_changed=False, recoverable=False)
+            return prepared["changeAnalysis"]
+        evidence = prepared.get("preparationEvidence")
+        if not isinstance(evidence, dict):
+            raise CommandError("CONTRACT_MISMATCH", "Prepared code candidate lacks change-analysis evidence.", stage="prepare", runtime_changed=False, recoverable=False)
+        return evidence.get("changeAnalysis")
 
     def _compose(
         self,
@@ -208,6 +317,7 @@ class CompositePreparationProvider:
         request: dict[str, Any],
         code_prepared: Any,
         resource_prepared: Any,
+        route_selection: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         runtime_state = request.get("runtimeState")
         job_id = request.get("jobId")
@@ -230,8 +340,11 @@ class CompositePreparationProvider:
             task, job_id, runtime_state, code_prepared, code_snapshot, code_digest
         )
         resource, resource_evidence = self._validate_resource_candidate(
-            task, job_id, runtime_state, resource_prepared, resource_snapshot, resource_digest
+            task, job_id, runtime_state, resource_prepared, resource_snapshot, resource_digest,
+            expected_change_analysis=route_selection["resourceAnalysis"],
         )
+        if route_selection["route"] != COMPOSITE_ROUTE or route_selection["codeAnalysis"] != code_evidence["changeAnalysis"]:
+            raise CommandError("CONTRACT_MISMATCH", "Composite route does not match verified code/resource deltas.", stage="prepare", runtime_changed=False, recoverable=False)
         if set(code["artifactIds"]) & set(resource["artifactIds"]):
             raise CommandError("CONTRACT_MISMATCH", "Code and resource artifact closures overlap.", stage="prepare", runtime_changed=False, recoverable=False)
 
@@ -295,12 +408,13 @@ class CompositePreparationProvider:
         }
         evidence = {
             "schema": COMPOSITE_EVIDENCE_SCHEMA,
-            "version": 1,
+            "version": 2,
             "providerId": self.provider_id,
             "inputSnapshot": composite_snapshot,
             "profileDigest": composite_digest,
             "code": code_evidence,
             "resource": resource_evidence,
+            "routeSelection": route_selection,
         }
         return {
             "inputSnapshot": composite_snapshot,
@@ -352,6 +466,18 @@ class CompositePreparationProvider:
         evidence = value["preparationEvidence"]
         if not isinstance(evidence, dict) or evidence.get("providerId") != getattr(self.code_provider, "provider_id", None):
             raise CommandError("CONTRACT_MISMATCH", "Code candidate lacks its provider-bound preparation evidence.", stage="prepare", runtime_changed=False, recoverable=False)
+        try:
+            code_analysis = validate_component_analysis(
+                evidence.get("changeAnalysis"),
+                component="code",
+                provider_id=self.code_provider.provider_id,
+                input_snapshot=snapshot,
+                profile_digest=digest,
+            )
+        except RouteSelectionError as exc:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Composite code classification is unknown or mismatched.", stage="prepare", runtime_changed=False, recoverable=False) from exc
+        if code_analysis["disposition"] != "STRUCTURE":
+            raise CommandError("CAPABILITY_UNAVAILABLE", "The available composite runtime route requires a structural code change.", stage="prepare", runtime_changed=False, recoverable=False)
         artifacts = self._verify_artifact_list(value["artifacts"], task["taskId"], job_id)
         ids = [item["artifactId"] for item in artifacts]
         if not ids or len(set(ids)) != len(ids):
@@ -396,12 +522,14 @@ class CompositePreparationProvider:
         }, dict(evidence)
 
     def _validate_resource_candidate(
-        self, task: dict[str, Any], job_id: str, state: dict[str, Any], value: Any, snapshot: str, digest: str
+        self, task: dict[str, Any], job_id: str, state: dict[str, Any], value: Any, snapshot: str, digest: str,
+        *, expected_change_analysis: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         required = {
             "inputSnapshot", "profileDigest", "expectedRuntimeRevision", "resourceReleaseBefore", "resourceReleaseAfter",
             "manifestArtifactId", "archiveArtifactId", "artifactIds", "artifacts", "requiredArtifactKinds",
             "contextRequirements", "affectedViews", "prepareComplete", "approvalRequired", "preparationEvidence",
+            "changeAnalysis",
         }
         if not isinstance(value, dict) or set(value) != required:
             raise CommandError("CONTRACT_MISMATCH", "Resource candidate fields do not match the composite preparation contract.", stage="prepare", runtime_changed=False, recoverable=False)
@@ -471,6 +599,18 @@ class CompositePreparationProvider:
             or not SHA256_RE.fullmatch(evidence["editorRequestDigest"])
         ):
             raise CommandError("CONTRACT_MISMATCH", "Resource candidate lacks sealed asset-build evidence.", stage="prepare", runtime_changed=False, recoverable=False)
+        try:
+            change_analysis = validate_component_analysis(
+                value["changeAnalysis"],
+                component="resource",
+                provider_id=self.resource_provider.provider_id,
+                input_snapshot=snapshot,
+                profile_digest=digest,
+            )
+        except RouteSelectionError as exc:
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Resource candidate lacks verified delta analysis.", stage="prepare", runtime_changed=False, recoverable=False) from exc
+        if change_analysis != expected_change_analysis or change_analysis["disposition"] != "CHANGED":
+            raise CommandError("INPUT_CHANGED", "Resource candidate differs from its pre-build change analysis.", stage="prepare", runtime_changed=False, recoverable=False)
         profile = self._profile(self.resource_provider, task)
         if getattr(profile, "profile_id", evidence["profileId"]) != evidence["profileId"]:
             raise CommandError("INPUT_CHANGED", "Resource evidence profile differs from the current server profile.", stage="prepare", runtime_changed=False, recoverable=False)
@@ -539,6 +679,22 @@ class CompositePreparationProvider:
         ):
             raise CommandError("INPUT_CHANGED", "Composite preparation result no longer matches its component binding.", stage="prepare", runtime_changed=False, recoverable=False)
 
+    def verify_preparation_receipt(
+        self,
+        task: dict[str, Any],
+        evidence: dict[str, Any],
+        *,
+        expected_input_snapshot: str,
+    ) -> None:
+        resource_analysis = self._analyze_resource(task)
+        code_snapshot = self.code_provider.current_input_snapshot(task)
+        if resource_analysis["disposition"] != "UNCHANGED" or expected_input_snapshot != code_snapshot:
+            raise CommandError("INPUT_CHANGED", "A code-only plan no longer has an unchanged resource component.", stage="source_snapshot", runtime_changed=False, recoverable=False)
+        verifier = getattr(self.code_provider, "verify_preparation_receipt", None)
+        if not callable(verifier):
+            raise CommandError("CAPABILITY_UNAVAILABLE", "Code-only plan lacks a compiler receipt verifier.", stage="prepare", runtime_changed=False, recoverable=False)
+        verifier(task, evidence, expected_input_snapshot=expected_input_snapshot)
+
     def verify_preparation_plan(
         self,
         task: dict[str, Any],
@@ -583,6 +739,15 @@ class CompositePreparationProvider:
                 raise ValueError("code evidence differs from the code profile or owner job")
             if evidence["resource"] != resource["editorEvidence"]:
                 raise ValueError("resource evidence differs from the resource candidate binding")
+            route_selection = verify_route_selection(evidence["routeSelection"])
+            current_resource_analysis = self._analyze_resource(task)
+            if (
+                route_selection["route"] != COMPOSITE_ROUTE
+                or route_selection["codeAnalysis"] != evidence["code"].get("changeAnalysis")
+                or route_selection["resourceAnalysis"] != current_resource_analysis
+                or current_resource_analysis["disposition"] != "CHANGED"
+            ):
+                raise ValueError("automatic route selection differs from the current component analyses")
             self._verify_code_manifest(task, binding, job_id)
             self._verify_resource_manifest(task, binding, job_id)
             expected_code_snapshot = code["inputSnapshot"]
@@ -602,10 +767,10 @@ class CompositePreparationProvider:
     ) -> None:
         if (
             not isinstance(evidence, dict)
-            or set(evidence) != {"schema", "version", "providerId", "inputSnapshot", "profileDigest", "code", "resource"}
+            or set(evidence) != {"schema", "version", "providerId", "inputSnapshot", "profileDigest", "code", "resource", "routeSelection"}
             or evidence.get("schema") != COMPOSITE_EVIDENCE_SCHEMA
             or type(evidence.get("version")) is not int
-            or evidence["version"] != 1
+            or evidence["version"] != 2
             or evidence.get("providerId") != self.provider_id
             or not isinstance(binding, dict)
             or set(binding) != {"schema", "version", "taskId", "sessionId", "inputSnapshot", "profileDigest", "runtimeState", "code", "resource"}
@@ -626,6 +791,7 @@ class CompositePreparationProvider:
             raise ValueError("composite evidence or plan binding fields differ")
         if runtime_state is not None and binding["runtimeState"] != runtime_state:
             raise ValueError("composite runtime observation differs")
+        route_selection = verify_route_selection(evidence["routeSelection"])
         code, resource = binding.get("code"), binding.get("resource")
         code_fields = {
             "providerId", "inputSnapshot", "profileDigest", "route", "manifestArtifactId", "manifestSha256",
@@ -655,6 +821,19 @@ class CompositePreparationProvider:
             raise ValueError("current code inputs differ")
         if resource["inputSnapshot"] != self.resource_provider.current_input_snapshot(task) or resource["profileDigest"] != self.resource_provider.current_profile_digest(task):
             raise ValueError("current resource inputs differ")
+        if (
+            route_selection["route"] != COMPOSITE_ROUTE
+            or route_selection["codeAnalysis"] != evidence["code"].get("changeAnalysis")
+            or route_selection["codeAnalysis"].get("inputSnapshot") != code["inputSnapshot"]
+            or route_selection["codeAnalysis"].get("profileDigest") != code["profileDigest"]
+            or route_selection["codeAnalysis"].get("providerId") != code["providerId"]
+            or route_selection["codeAnalysis"].get("disposition") != "STRUCTURE"
+            or route_selection["resourceAnalysis"].get("inputSnapshot") != resource["inputSnapshot"]
+            or route_selection["resourceAnalysis"].get("profileDigest") != resource["profileDigest"]
+            or route_selection["resourceAnalysis"].get("providerId") != resource["providerId"]
+            or route_selection["resourceAnalysis"].get("disposition") != "CHANGED"
+        ):
+            raise ValueError("automatic route selection does not bind both changed components")
 
     def _verify_code_manifest(self, task: dict[str, Any], binding: dict[str, Any], job_id: str | None) -> None:
         code = binding["code"]

@@ -17,8 +17,10 @@ internal static class SyntheticEditorJobTombstoneTests
                 throw new ArgumentException("One mailbox root is required.");
             }
 
-            VerifyArchivedAttemptCannotBeginAgain(args[0]);
-            Console.WriteLine("EDITOR MAILBOX PASS: archived attempt plus missing result produced STATE_UNKNOWN without a second BeginCompile.");
+            VerifyArchivedAttemptCannotBeginAgain(Path.Combine(args[0], "durable"), false, false);
+            VerifyArchivedAttemptCannotBeginAgain(Path.Combine(args[0], "legacy-archive"), true, false);
+            VerifyArchivedAttemptCannotBeginAgain(Path.Combine(args[0], "legacy-orphan"), true, true);
+            Console.WriteLine("EDITOR MAILBOX PASS: durable and legacy archived/orphan attempts plus missing result never began a second compile.");
             return 0;
         }
         catch (Exception exception)
@@ -28,7 +30,7 @@ internal static class SyntheticEditorJobTombstoneTests
         }
     }
 
-    private static void VerifyArchivedAttemptCannotBeginAgain(string mailboxRoot)
+    private static void VerifyArchivedAttemptCannotBeginAgain(string mailboxRoot, bool legacy, bool orphan)
     {
         Directory.CreateDirectory(mailboxRoot);
         var artifactRoot = Path.Combine(mailboxRoot, "artifacts");
@@ -68,6 +70,15 @@ internal static class SyntheticEditorJobTombstoneTests
             "durable attempt tombstone survives request and attempt archival");
 
         File.Delete(resultPath);
+        if (legacy)
+        {
+            File.Delete(Path.Combine(mailboxRoot, "attempt-tombstones", request.jobId + ".attempt.json"));
+            if (orphan)
+            {
+                var archivedAttempt = Directory.GetFiles(Path.Combine(mailboxRoot, "archive"), "*.attempt.json")[0];
+                File.Move(archivedAttempt, Path.Combine(mailboxRoot, "processing", request.jobId + ".attempt.json"));
+            }
+        }
         File.WriteAllBytes(incomingPath, requestBytes);
         worker.Tick();
 

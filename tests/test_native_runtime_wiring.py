@@ -65,6 +65,7 @@ class FakeAuthenticatedPlayerTransport:
         self.view_generation = 4
         self.resource_release = RESOURCE_RELEASE
         self.native_ready = True
+        self.hotfix_capability_available = True
         self.missing_module_id = False
         self.wrong_module_id = False
         self.mutate_payload_on_capture: Path | None = None
@@ -80,6 +81,19 @@ class FakeAuthenticatedPlayerTransport:
             "launchId": self.launch_id if self.authenticated else None,
             "expectedRuntimeRevision": self.expected_revision,
             "nativeCapabilitiesVerified": False,
+        }
+
+    def verified_route_capability(self, route: str) -> dict[str, Any] | None:
+        if route != "HOTFIX" or not self.hotfix_capability_available:
+            return None
+        return {
+            "schema": "relay.liveloop.verified-route-capability",
+            "version": 1,
+            "route": route,
+            "sessionId": self.session_id,
+            "launchId": self.launch_id,
+            "compatibilityId": "synthetic-hotfix-v1",
+            "verified": True,
         }
 
     def update_expected_runtime_revision(self, previous: str, current: str) -> None:
