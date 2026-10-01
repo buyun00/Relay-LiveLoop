@@ -72,6 +72,14 @@ The length-prefixed input-set digest algorithm remains unchanged: the new scope 
 
 The declared project `sourceInputs` and their `inputSnapshot` keep their existing separate semantics. Explicit external-input handling does not claim complete arbitrary compiler argument/analyzer/source-generator reads or a proven compiler process identity. The same enumerated-only coverage classification and required limitations remain mandatory.
 
+## Completed Reload baseline and compiler call timing
+
+A normal source compiler Reload can retain the authenticated `module.load` assembly closure, DLL/PDB hashes, MVID, module generation, compiler receipt and registered runtime manifest. The retained version is usable by the next normal Prepare only after the same iterate job is completed with `runtimeChanged: true` and `runtimeMatched: true`. Accepted, running, failed, unknown, changed-launch or mismatched-generation results cannot advance the baseline. Each Prepare reopens the immutable artifacts and checks their identities and bytes. It derives new task-owned Library baseline copies without overwriting configured baselines or changing the server profile pointer. After Host restart, a fresh authenticated runtime observation is required.
+
+Input receipt versions 1 and 2 remain readable without a per-call timing claim. Receipt version 3 (legacy roots) or 4 (explicit trusted roots) adds exactly two `compilerInvocations`: `actualCompileDll` and `normalTypeDbCompile`. Each carries its API, UTC interval, independent monotonic `elapsedTicks`/`frequency`, exact task-owned output directory and complete output hashes. The first interval surrounds the actual synchronous SDK `CompileDll` call, which returns void. A separate normal `CompilePlayerScripts` call supplies the genuine TypeDB and returned assembly set. Both DLL inventories must match the sealed payload output hashes; the normal invocation supplies payload symbols. Recovery validates the existing inventories without invoking either compiler again. Unsupported settings or changed outputs fail closed.
+
+The independent calls add real Prepare latency. Baseline compilation, dispatch, hashing and the TypeDB call are not included in the measured `actualCompileDll` interval. Synthetic command-service and receipt tests verify these Host boundaries; they do not establish actual Unity compiler timing, Reload, Hotfix or Player acceptance.
+
 ## Lost Editor result and no-replay boundary
 
 Before placing an Editor request in the incoming mailbox, Host creates a durable per-job submission tombstone bound to the job ID, request digest, input snapshot, and provider ID. A missing incoming/processing request and result cannot be interpreted as an unsubmitted job after that tombstone exists; same-job recovery returns `STATE_UNKNOWN` and does not write a replacement request.

@@ -204,7 +204,13 @@ class FakeAuthenticatedPlayerTransport:
             return self._mutating_reply(
                 request_id,
                 operation,
-                {"moduleId": candidate["moduleId"], "moduleGeneration": candidate["nextGeneration"]},
+                {"moduleId": candidate["moduleId"], "moduleGeneration": candidate["nextGeneration"],
+                 "loadedAssemblies": [{"taskId": command["taskId"], "inputSha256": candidate["inputSha256"],
+                    "assemblyName": row["name"], "loadedAssemblyName": row["name"],
+                    "loadedAssemblyFullName": row["name"] + ", Version=1.0.0.0",
+                    "moduleVersionId": "10000000-0000-0000-0000-000000000001", "generation": row["generationAfter"],
+                    "loadedDllSha256": row["dllSha256"], "loadedPdbSha256": row["pdbSha256"] if row["pdbBase64"] else "",
+                    "loaderApi": "synthetic-verified-loader"} for row in candidate["payloads"]]},
                 lose_after_effect=True,
             )
         if operation == "resource.activate":

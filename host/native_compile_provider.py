@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .editor_transport import EditorJobEnvelope
+from .applied_compile_baseline import current_profile
 from .errors import CommandError, capability_unavailable
 from .change_routing import (
     RouteSelectionError,
@@ -117,7 +118,7 @@ class NativeSourcePreparationProvider:
         return self.is_verified
 
     def profile_for_task(self, task: dict[str, Any]) -> NativeCompileProfile:
-        return self._profiles.for_task(task)
+        return current_profile(self._ledger, self._artifacts, self._runtime, task, self._profiles.for_task(task))
 
     def current_profile_digest(self, task: dict[str, Any]) -> str:
         return native_compile_profile_digest(self.profile_for_task(task))

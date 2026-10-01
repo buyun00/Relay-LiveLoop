@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .errors import CommandError
+from .compile_invocations import validate_invocations
 from .native_compile_profile import (
     NativeCompileProfile,
     _reject_reparse_path,
@@ -334,11 +335,14 @@ def validate_native_compile_input_receipt(
             "outputs",
         }
         extended = profile.profile_version == 3
+        timed = isinstance(value, dict) and type(value.get("version")) is int and value["version"] in (3, 4)
+        if timed:
+            required.add("compilerInvocations")
         if extended:
             required.add("trustedSourceRoots")
         if not isinstance(value, dict) or set(value) != required:
             raise ValueError("Receipt fields do not match the frozen compile-input contract")
-        if value["schema"] != RECEIPT_SCHEMA or type(value["version"]) is not int or value["version"] != (2 if extended else RECEIPT_VERSION):
+        if value["schema"] != RECEIPT_SCHEMA or type(value["version"]) is not int or value["version"] != ((4 if extended else 3) if timed else (2 if extended else RECEIPT_VERSION)):
             raise ValueError("Receipt schema/version is unsupported")
         if extended and value["trustedSourceRoots"] != profile.context_source_roots():
             raise ValueError("Receipt trusted roots differ from the server-owned normalized configuration")
@@ -583,6 +587,8 @@ def validate_native_compile_input_receipt(
             if expected["extension"].casefold() == ".dll" and relative.casefold() not in compile_result_names:
                 raise ValueError("Analysis DLL is absent from the CompilePlayerScripts result paths")
 
+        if timed:
+            validate_invocations(value["compilerInvocations"], receipt_parent, output_by_name, _hash_file)
         return value
     except CommandError:
         raise

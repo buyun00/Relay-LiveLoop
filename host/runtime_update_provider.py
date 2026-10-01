@@ -420,6 +420,7 @@ class PlayerRuntimeUpdateProvider:
         self._require_configuration("runtime_apply")
         with self._lock:
             self._mutation_may_have_started = False
+            self._verified_reload_loaded = None
             before = self._last_states.get(plan["taskId"])
             if before is None:
                 raise CommandError("STATE_UNKNOWN", "No task-bound authenticated observation preceded apply.", stage="runtime_apply", runtime_changed=None, recoverable=False)
@@ -457,6 +458,12 @@ class PlayerRuntimeUpdateProvider:
                 return self._state_unknown("Player revision differs from the immutable hotfix transition.", after["runtimeRevision"], applied)
             if after["runtimeRevision"] == before["runtimeRevision"]:
                 return self._state_unknown("Player reported completion without advancing its runtime revision.", after["runtimeRevision"], applied)
+            compiler_evidence = plan["details"].get("preparationEvidence") or {}
+            if plan["route"] == COMPOSITE_ROUTE:
+                compiler_evidence = compiler_evidence.get("code") or {}
+            if plan["route"] != "HOTFIX" and compiler_evidence.get("providerId") == "source-snapshot-native-compile-preparation":
+                from .applied_compile_baseline import retain_verified_reload
+                retain_verified_reload(self, plan, manifest, job_id, after, self._verified_reload_loaded)
             return {
                 "status": "completed",
                 "runtimeChanged": True,
@@ -712,6 +719,15 @@ class PlayerRuntimeUpdateProvider:
         load_result = load_value.get("result")
         if not isinstance(load_result, dict) or load_result.get("moduleId") != module_id or load_result.get("moduleGeneration") != manifest["nextGeneration"]:
             raise self._contract_error("module.load result differs from the prepared module generation.", "runtime_apply", True)
+        compiler_evidence = plan["details"].get("preparationEvidence") or {}
+        if plan["route"] == COMPOSITE_ROUTE:
+            compiler_evidence = compiler_evidence.get("code") or {}
+        if compiler_evidence.get("providerId") == "source-snapshot-native-compile-preparation":
+            from .applied_compile_baseline import validate_loaded_rows
+            self._verified_reload_loaded = {
+                "inputSha256": load_command["arguments"]["candidate"]["inputSha256"],
+                "rows": validate_loaded_rows(plan, manifest, candidate, load_command["arguments"]["candidate"]["inputSha256"], load_result.get("loadedAssemblies")),
+            }
         self._module_generations[module_id] = manifest["nextGeneration"]
         applied.append("module.load")
 
