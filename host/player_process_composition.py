@@ -15,7 +15,7 @@ import tempfile
 import threading
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -569,6 +569,18 @@ class JsonPlayerRegistrationStore:
             return result
 
 
+def windows_filetime_start_time_utc(ticks: int) -> str:
+    """Format exact unsigned 100 ns FILETIME at the protocol's microsecond precision.
+
+    The remaining 100 ns digit is truncated, as for the existing UTC identity
+    representation. Never round through floating-point Unix seconds.
+    """
+    if type(ticks) is not int or not 0 <= ticks <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("FILETIME must be an unsigned 64-bit integer")
+    instant = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+    return instant.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 class WindowsProcessIdentityReader:
     """Concrete Windows PID, creation-time, and executable-path reader."""
 
@@ -629,8 +641,7 @@ class WindowsProcessIdentityReader:
         if not self._kernel32.QueryFullProcessImageNameW(handle, 0, executable, ctypes.byref(length)):
             return None
         ticks = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
-        unix_ticks = ticks - 116444736000000000
-        start_time = datetime.fromtimestamp(unix_ticks / 10_000_000, tz=timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        start_time = windows_filetime_start_time_utc(ticks)
         return ProcessIdentity(process_id, start_time, executable.value[: length.value])
 
 
